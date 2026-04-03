@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import pandas as pd
 
@@ -53,6 +53,8 @@ class CorpusExpander:
         top_k_candidates: int = 100,
         relevance_threshold: float = 0.3,
         min_new_papers: int = 1,
+        allowed_domains: list[str] | None = None,
+        on_iteration: Callable[[int, int, int, int], None] | None = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Iteratively expand corpus with topically relevant, structurally
@@ -73,7 +75,9 @@ class CorpusExpander:
         Returns:
             (papers_df, citations_df) — final expanded DataFrames from corpus.
         """
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
+            seed_count = len(corpus.papers_df)
+
             # 1. Graph operations
             G = self._engine.build_graph(corpus.papers_df, corpus.citations_df)
             scores = self._engine.compute_pagerank(G)
@@ -91,6 +95,20 @@ class CorpusExpander:
             # 2. Fetch candidate metadata
             raw = self._client.get_papers_batch(candidate_ids)
             candidate_dicts = [d for d in raw if d and d.get("paperId")]
+
+            if not candidate_dicts:
+                break
+
+            # Domain filter (when allowed_domains is set)
+            if allowed_domains is not None:
+                domain_set = set(allowed_domains)
+                candidate_dicts = [
+                    d for d in candidate_dicts
+                    if d.get("fieldsOfStudy") and domain_set.intersection(d["fieldsOfStudy"])
+                ]
+
+            if not candidate_dicts:
+                break
 
             # 3. Relevance filter
             relevant_dicts = self._filter.filter(
@@ -127,6 +145,16 @@ class CorpusExpander:
                     pd.concat([corpus.citations_df, new_citations_df], ignore_index=True)
                     .drop_duplicates(subset=["source", "target"])
                     .reset_index(drop=True)
+                )
+
+            new_paper_count = len(corpus.papers_df) - seed_count
+
+            if on_iteration is not None:
+                on_iteration(
+                    iteration + 1,
+                    seed_count,
+                    len(new_citations_df),
+                    new_paper_count,
                 )
 
             # 7. Convergence check

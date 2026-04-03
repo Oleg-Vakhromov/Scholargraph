@@ -143,7 +143,10 @@ class GraphEngine:
             return []
 
         corpus_ids = set(papers_df["paper_id"])
-        referenced_ids = set(citations_df["target"].dropna())
+        referenced_ids = (
+            set(citations_df["target"].dropna()) |
+            set(citations_df["source"].dropna())
+        )
         candidates = referenced_ids - corpus_ids
 
         if not candidates:

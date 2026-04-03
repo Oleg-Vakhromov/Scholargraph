@@ -29,14 +29,16 @@ class SemanticScholarClient:
             time.sleep(_RATE_LIMIT_INTERVAL - elapsed)
 
     def _get(self, path: str, params: dict) -> dict:
-        self._wait_for_rate_limit()
-        response = requests.get(f"{BASE_URL}{path}", params=params)
-        self._last_request_time = time.time()
-
-        if response.status_code == 429:
-            time.sleep(60)
+        delay = 60
+        for attempt in range(4):
+            self._wait_for_rate_limit()
             response = requests.get(f"{BASE_URL}{path}", params=params)
             self._last_request_time = time.time()
+            if response.status_code != 429:
+                break
+            if attempt < 3:
+                time.sleep(delay)
+                delay *= 2
 
         if not response.ok:
             raise RuntimeError(
@@ -45,14 +47,16 @@ class SemanticScholarClient:
         return response.json()
 
     def _post(self, path: str, params: dict, body: dict) -> list:
-        self._wait_for_rate_limit()
-        response = requests.post(f"{BASE_URL}{path}", params=params, json=body)
-        self._last_request_time = time.time()
-
-        if response.status_code == 429:
-            time.sleep(60)
+        delay = 60
+        for attempt in range(4):
+            self._wait_for_rate_limit()
             response = requests.post(f"{BASE_URL}{path}", params=params, json=body)
             self._last_request_time = time.time()
+            if response.status_code != 429:
+                break
+            if attempt < 3:
+                time.sleep(delay)
+                delay *= 2
 
         if not response.ok:
             raise RuntimeError(
@@ -186,7 +190,7 @@ class SemanticScholarClient:
 
     def get_references(self, paper_id: str) -> List[dict]:
         """
-        GET /paper/{paperId}/references
+        GET /paper/{paperId}/references  (paginated)
 
         Returns a list of citation dicts with keys:
             source  — the requesting paper's ID
@@ -194,39 +198,95 @@ class SemanticScholarClient:
             title   — title of the referenced paper (may be None)
             year    — publication year of the referenced paper (may be None)
 
+        Paginates using offset until all pages are exhausted (limit=1000 per page).
         When a DiskCache is attached, returns cached result immediately if available.
-        Otherwise fetches from API and stores to cache.
-
         Returns an empty list if paper_id is None or the paper has no references.
         """
         if not paper_id:
             return []
 
-        # Serve from cache if available
         if self._cache is not None and self._cache.has_references(paper_id):
             return self._cache.get_references(paper_id)
 
-        data = self._get(
-            f"/paper/{paper_id}/references",
-            params={"fields": "paperId,title,year"},
-        )
-
         citations = []
-        for item in (data.get("data") or [] if data else []):
-            ref = item.get("citedPaper") or {}
-            target_id = ref.get("paperId")
-            if not target_id:
-                continue
-            citations.append({
-                "source": paper_id,
-                "target": target_id,
-                "title": ref.get("title"),
-                "year": ref.get("year"),
-            })
+        offset = 0
 
-        # Store to cache
+        while True:
+            data = self._get(
+                f"/paper/{paper_id}/references",
+                params={"fields": "paperId,title,year", "limit": 1000, "offset": offset},
+            )
+            batch = data.get("data") or []
+            for item in batch:
+                ref = item.get("citedPaper") or {}
+                target_id = ref.get("paperId")
+                if not target_id:
+                    continue
+                citations.append({
+                    "source": paper_id,
+                    "target": target_id,
+                    "title": ref.get("title"),
+                    "year": ref.get("year"),
+                })
+            next_offset = data.get("next")
+            if not next_offset or not batch:
+                break
+            offset = next_offset
+
         if self._cache is not None:
             self._cache.set_references(paper_id, citations)
+            self._cache.save()
+
+        return citations
+
+    def get_citations(self, paper_id: str) -> List[dict]:
+        """
+        GET /paper/{paperId}/citations  (paginated)
+
+        Returns papers that cite this paper (incoming citations).
+        Each dict has keys:
+            source  — the citing paper's ID
+            target  — this paper's ID
+            title   — title of the citing paper (may be None)
+            year    — publication year of the citing paper (may be None)
+
+        Paginates using offset until all pages are exhausted (limit=1000 per page).
+        When a DiskCache is attached, returns cached result immediately if available.
+        Returns an empty list if paper_id is None or the paper has no citations.
+        """
+        if not paper_id:
+            return []
+
+        if self._cache is not None and self._cache.has_incoming_citations(paper_id):
+            return self._cache.get_incoming_citations(paper_id)
+
+        citations = []
+        offset = 0
+
+        while True:
+            data = self._get(
+                f"/paper/{paper_id}/citations",
+                params={"fields": "paperId,title,year", "limit": 1000, "offset": offset},
+            )
+            batch = data.get("data") or []
+            for item in batch:
+                citing = item.get("citingPaper") or {}
+                source_id = citing.get("paperId")
+                if not source_id:
+                    continue
+                citations.append({
+                    "source": source_id,
+                    "target": paper_id,
+                    "title": citing.get("title"),
+                    "year": citing.get("year"),
+                })
+            next_offset = data.get("next")
+            if not next_offset or not batch:
+                break
+            offset = next_offset
+
+        if self._cache is not None:
+            self._cache.set_incoming_citations(paper_id, citations)
             self._cache.save()
 
         return citations

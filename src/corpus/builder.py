@@ -85,6 +85,69 @@ class CorpusBuilder:
         self.papers_df = df
         return self.papers_df
 
+    def extract_domains(self) -> list[str]:
+        """
+        Return a sorted list of unique field-of-study strings across all seed papers.
+
+        Each row's `fields_of_study` value is either None or a list of strings.
+        Returns [] if the corpus is empty or no domain data is present.
+        """
+        if self.papers_df.empty:
+            return []
+
+        collected: set[str] = set()
+        for value in self.papers_df["fields_of_study"]:
+            if not value:
+                continue
+            for domain in value:
+                if domain:
+                    collected.add(domain)
+
+        return sorted(collected)
+
+    def apply_domain_filter(
+        self,
+        selected_domains: list[str],
+        max_papers: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        Filter papers_df to papers belonging to at least one selected domain,
+        then optionally cap to the top-N by citation count.
+
+        Mutates self.papers_df in place and returns it.
+
+        Args:
+            selected_domains: List of domain strings to keep.
+            max_papers:       If set, retain only the top-N papers by citation_count
+                              after domain filtering.
+
+        Returns:
+            Filtered (and optionally capped) papers_df.
+        """
+        if self.papers_df.empty or not selected_domains:
+            self.papers_df = pd.DataFrame()
+            return self.papers_df
+
+        domain_set = set(selected_domains)
+
+        mask = [
+            bool(value and domain_set.intersection(value))
+            for value in self.papers_df["fields_of_study"]
+        ]
+
+        filtered_df = self.papers_df[mask].reset_index(drop=True)
+
+        if max_papers is not None and len(filtered_df) > max_papers:
+            filtered_df = (
+                filtered_df
+                .sort_values("citation_count", ascending=False)
+                .head(max_papers)
+                .reset_index(drop=True)
+            )
+
+        self.papers_df = filtered_df
+        return self.papers_df
+
     def fetch_references(self, paper_ids=None) -> pd.DataFrame:
         """
         Fetch references for corpus papers and build citations_df.
@@ -107,8 +170,11 @@ class CorpusBuilder:
 
         all_citations = []
         for paper_id in paper_ids:
-            refs = self._client.get_references(paper_id)
-            for r in refs:
+            for r in self._client.get_references(paper_id):
+                c = Citation.from_api_dict(r)
+                if c.source and c.target:
+                    all_citations.append(c)
+            for r in self._client.get_citations(paper_id):
                 c = Citation.from_api_dict(r)
                 if c.source and c.target:
                     all_citations.append(c)

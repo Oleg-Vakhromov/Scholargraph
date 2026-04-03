@@ -5,3 +5,4 @@ python-louvain>=0.16
 sentence-transformers>=2.7
 streamlit>=1.35
 pyvis>=0.3
+scikit-learn>=1.3
