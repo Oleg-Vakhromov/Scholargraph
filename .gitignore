@@ -1,0 +1,22 @@
+# Framework / docs (not part of the public repo)
+.claude/
+.paul/
+README.md
+scopus_readme.md
+scopus_api_search.py
+semantic_scholar_api_specs.json
+
+# Runtime artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# Data & cache (local only)
+data/
+cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
