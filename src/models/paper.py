@@ -14,7 +14,7 @@ class Paper:
     authors: Optional[str]           # comma-separated author names
     num_authors: Optional[int]
     year: Optional[int]
-    venue: Optional[str]
+    journal: Optional[str]
     citation_count: int
     reference_count: Optional[int]
     fields_of_study: Optional[List[str]]
@@ -34,7 +34,7 @@ class Paper:
             authors=d.get("authors_str"),
             num_authors=d.get("num_authors"),
             year=d.get("year"),
-            venue=d.get("venue"),
+            journal=d.get("venue"),
             citation_count=d.get("citationCount") or 0,
             reference_count=d.get("referenceCount"),
             fields_of_study=d.get("fieldsOfStudy"),
@@ -63,7 +63,7 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
     Convert a list of Paper dataclasses to a pandas DataFrame.
 
     Columns (in order):
-        paper_id, title, abstract, authors, num_authors, year, venue,
+        paper_id, title, abstract, authors, num_authors, year, journal,
         citation_count, reference_count, fields_of_study
 
     dtypes:
@@ -79,7 +79,7 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
             "authors": p.authors,
             "num_authors": p.num_authors,
             "year": p.year,
-            "venue": p.venue,
+            "journal": p.journal,
             "citation_count": p.citation_count,
             "reference_count": p.reference_count,
             "fields_of_study": p.fields_of_study,
@@ -91,7 +91,7 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
         records,
         columns=[
             "paper_id", "title", "abstract", "authors", "num_authors",
-            "year", "venue", "citation_count", "reference_count", "fields_of_study",
+            "year", "journal", "citation_count", "reference_count", "fields_of_study",
         ],
     )
 

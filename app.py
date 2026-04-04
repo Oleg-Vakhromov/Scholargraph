@@ -2,6 +2,10 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
+from src.analysis.scimago import ScimagoLoader
+
+_scimago = ScimagoLoader()
+_scimago.load("data/scimago.csv")
 
 # ---------------------------------------------------------------------------
 # Cached resource loaders — loaded once, reused across reruns
@@ -60,6 +64,14 @@ if "cocitation_df" not in st.session_state:
     st.session_state["cocitation_df"] = None
 if "cocitation_clusters" not in st.session_state:
     st.session_state["cocitation_clusters"] = None
+if "cluster_params" not in st.session_state:
+    st.session_state["cluster_params"] = None
+if "available_quartiles" not in st.session_state:
+    st.session_state["available_quartiles"] = []
+if "selected_quartiles" not in st.session_state:
+    st.session_state["selected_quartiles"] = []
+if "scimago_loaded" not in st.session_state:
+    st.session_state["scimago_loaded"] = False
 if "bibcoupling_df" not in st.session_state:
     st.session_state["bibcoupling_df"] = None
 if "bibcoupling_clusters" not in st.session_state:
@@ -114,6 +126,10 @@ if run_button:
         st.session_state["partition"] = None
         st.session_state["cluster_labels"] = None
         st.session_state["cluster_summary"] = None
+        st.session_state["cluster_params"] = None
+        st.session_state["available_quartiles"] = []
+        st.session_state["selected_quartiles"] = []
+        st.session_state["scimago_loaded"] = False
         st.session_state["pipeline_log"] = []
         st.session_state["influence_df"] = None
         st.session_state["cocitation_df"] = None
@@ -128,6 +144,10 @@ if run_button:
             client = _get_client()
             corpus = CorpusBuilder(client)
             corpus.seed(query.strip(), limit=int(limit), year_range=year_range)
+            if _scimago.is_loaded and not corpus.papers_df.empty:
+                corpus.papers_df = _scimago.enrich_papers(corpus.papers_df)
+                st.session_state["available_quartiles"] = _scimago.available_quartiles(corpus.papers_df)
+                st.session_state["scimago_loaded"] = True
             st.write(f"Seed complete — {len(corpus.papers_df)} papers")
             status.update(label="Seed complete", state="complete")
 
@@ -155,6 +175,17 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
         chosen = []
         st.info("No field-of-study data available for seed papers — proceeding without domain filter.")
 
+    if st.session_state.get("scimago_loaded") and st.session_state.get("available_quartiles"):
+        st.caption("Restrict corpus to journals in selected SCImago quartiles. Papers with no quartile data are excluded when any quartile is selected.")
+        selected_quartiles = st.multiselect(
+            "Journal quartile filter",
+            options=st.session_state["available_quartiles"],
+            default=[],
+            key="quartile_multiselect",
+        )
+    else:
+        selected_quartiles = []
+
     confirm_button = st.button("Confirm domains & continue", type="primary")
 
     if confirm_button:
@@ -173,6 +204,13 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
             if selected:
                 corpus.apply_domain_filter(selected, max_papers=int(max_seed_papers))
                 _log(f"Domain filter applied — {len(corpus.papers_df)} papers retained")
+
+            # Apply quartile filter
+            if selected_quartiles:
+                mask = corpus.papers_df["scimago_quartile"].isin(selected_quartiles)
+                corpus.papers_df = corpus.papers_df[mask].reset_index(drop=True)
+                _log(f"Quartile filter applied — {len(corpus.papers_df)} papers retained ({', '.join(selected_quartiles)})")
+            st.session_state["selected_quartiles"] = selected_quartiles
 
             st.session_state["selected_domains"] = selected
 
@@ -245,7 +283,7 @@ if st.session_state["papers_df"] is not None:
     st.subheader("Papers")
     st.caption("All papers collected during seeding and expansion, ranked by citation count. Higher citation counts indicate greater influence in the field.")
     display_cols = [
-        c for c in ["title", "year", "citation_count", "authors"]
+        c for c in ["title", "year", "journal", "citation_count", "authors"]
         if c in papers_df.columns
     ]
     st.dataframe(
@@ -280,7 +318,7 @@ if st.session_state["papers_df"] is not None:
     _inf_display = st.session_state["influence_df"]
     _inf_cols = [
         c for c in [
-            "title", "year", "citation_count",
+            "title", "year", "journal", "citation_count",
             "isc", "isc_ratio", "sample_relevance", "betweenness_centrality",
         ]
         if c in _inf_display.columns
@@ -469,23 +507,41 @@ if st.session_state["papers_df"] is not None:
     # -----------------------------------------------------------------------
     st.divider()
     st.subheader("Clusters")
-    st.caption("Research clusters detected via Louvain community detection on the citation graph. Each cluster represents a distinct sub-topic or research direction. Cluster labels are derived from the most frequent title words.")
+    st.caption(
+        "Research clusters detected via Louvain community detection on the citation graph. "
+        "Lower resolution produces fewer, broader clusters. Min cluster size merges small "
+        "noise clusters into their most-connected neighbour."
+    )
 
-    if "cluster_id" not in papers_df.columns:
+    _cl_col1, _cl_col2 = st.columns(2)
+    cluster_resolution = _cl_col1.slider(
+        "Resolution", min_value=0.1, max_value=2.0, value=0.5, step=0.1,
+        key="cluster_resolution",
+    )
+    min_cluster_size = _cl_col2.number_input(
+        "Min cluster size", min_value=1, max_value=50, value=3, step=1,
+        key="cluster_min_size",
+    )
+
+    _current_params = (float(cluster_resolution), int(min_cluster_size))
+
+    if st.session_state.get("cluster_params") != _current_params or "cluster_id" not in papers_df.columns:
         from src.analysis.cluster import ClusterEngine
         from src.graph.engine import GraphEngine
 
-        G = GraphEngine().build_graph(papers_df, st.session_state["citations_df"])
-        ce = ClusterEngine()
-        partition = ce.detect_communities(G)
-        papers_df = ce.add_cluster_assignments(papers_df, partition)
-        cluster_labels = ce.label_clusters(papers_df, partition)
-        cluster_summary = ce.cluster_summary_df(papers_df, cluster_labels)
+        _G_cl = GraphEngine().build_graph(papers_df, citations_df)
+        _ce = ClusterEngine()
+        _partition = _ce.detect_communities(_G_cl, resolution=float(cluster_resolution))
+        _partition = _ce.merge_small_clusters(_partition, papers_df, citations_df, min_size=int(min_cluster_size))
+        papers_df = _ce.add_cluster_assignments(papers_df, _partition)
+        _cluster_labels = _ce.label_clusters(papers_df, _partition)
+        _cluster_summary = _ce.cluster_summary_df(papers_df, _cluster_labels)
 
         st.session_state["papers_df"] = papers_df
-        st.session_state["partition"] = partition
-        st.session_state["cluster_labels"] = cluster_labels
-        st.session_state["cluster_summary"] = cluster_summary
+        st.session_state["partition"] = _partition
+        st.session_state["cluster_labels"] = _cluster_labels
+        st.session_state["cluster_summary"] = _cluster_summary
+        st.session_state["cluster_params"] = _current_params
 
     if st.session_state["cluster_summary"] is not None:
         st.dataframe(

@@ -63,6 +63,108 @@ class ClusterEngine:
         return community_louvain.best_partition(UG, resolution=resolution)
 
     # ------------------------------------------------------------------
+    # Cluster merging
+    # ------------------------------------------------------------------
+
+    def merge_small_clusters(
+        self,
+        partition: Dict[str, int],
+        papers_df: pd.DataFrame,
+        citations_df: pd.DataFrame,
+        min_size: int,
+    ) -> Dict[str, int]:
+        """
+        Merge clusters smaller than min_size into their best-connected neighbour.
+
+        For each small cluster, counts citation edges (in either direction) to
+        every other cluster and reassigns all its papers to the cluster with the
+        most connections. Falls back to the largest non-small cluster when no
+        citation edges exist.
+
+        One pass is sufficient: merging only grows target clusters, so a cluster
+        that was large enough at the start of the pass remains large.
+
+        Args:
+            partition:    Dict mapping paper_id → cluster_id (from detect_communities).
+            papers_df:    Corpus paper DataFrame (paper_id required).
+            citations_df: Citation edges DataFrame (source, target required).
+            min_size:     Clusters with fewer than this many papers are merged.
+                          Values <= 1 return a copy of partition unchanged.
+
+        Returns:
+            New Dict[str, int] with the same keys as partition. Does not mutate input.
+        """
+        if min_size <= 1 or not partition:
+            return dict(partition)
+
+        result = dict(partition)
+
+        # Count papers per cluster
+        cluster_sizes: Dict[int, int] = {}
+        for cid in result.values():
+            cluster_sizes[cid] = cluster_sizes.get(cid, 0) + 1
+
+        # Identify small clusters sorted smallest-first
+        small_clusters = sorted(
+            [cid for cid, size in cluster_sizes.items() if size < min_size],
+            key=lambda cid: cluster_sizes[cid],
+        )
+
+        if not small_clusters:
+            return result
+
+        small_set = set(small_clusters)
+
+        # Build inter-cluster edge counts from citations_df
+        edge_counts: Dict[tuple, int] = {}
+        if not citations_df.empty:
+            for _, row in citations_df.iterrows():
+                src, tgt = row["source"], row["target"]
+                if src not in result or tgt not in result:
+                    continue
+                c_src, c_tgt = result[src], result[tgt]
+                if c_src == c_tgt:
+                    continue
+                key = (min(c_src, c_tgt), max(c_src, c_tgt))
+                edge_counts[key] = edge_counts.get(key, 0) + 1
+
+        # Largest non-small cluster (fallback)
+        large_clusters = {cid: sz for cid, sz in cluster_sizes.items() if cid not in small_set}
+        fallback_cluster = max(large_clusters, key=large_clusters.get) if large_clusters else None
+
+        for small_cid in small_clusters:
+            # Find edges from this small cluster to non-small clusters
+            connections: Dict[int, int] = {}
+            for (ca, cb), count in edge_counts.items():
+                if ca == small_cid and cb not in small_set:
+                    connections[cb] = connections.get(cb, 0) + count
+                elif cb == small_cid and ca not in small_set:
+                    connections[ca] = connections.get(ca, 0) + count
+
+            if connections:
+                target = max(connections, key=connections.get)
+            elif fallback_cluster is not None:
+                target = fallback_cluster
+            else:
+                continue  # no valid target (entire corpus is tiny)
+
+            # Reassign all papers in the small cluster
+            for pid, cid in result.items():
+                if cid == small_cid:
+                    result[pid] = target
+
+            # Update sizes and remove from small_set
+            cluster_sizes[target] = cluster_sizes.get(target, 0) + cluster_sizes.pop(small_cid, 0)
+            small_set.discard(small_cid)
+
+            # Update fallback if it has grown
+            if fallback_cluster is not None:
+                large_clusters[target] = cluster_sizes[target]
+                fallback_cluster = max(large_clusters, key=large_clusters.get)
+
+        return result
+
+    # ------------------------------------------------------------------
     # Corpus enrichment
     # ------------------------------------------------------------------
 
