@@ -1,6 +1,8 @@
 # Scholargraph — User Guide
 
-Scholargraph is a local Streamlit application for building and exploring academic literature corpora. You provide a keyword query; the tool retrieves papers from Semantic Scholar, constructs a citation network, iteratively expands the corpus toward the most structurally important and topically relevant papers, and then surfaces research clusters, influence metrics, co-citation and bibliographic coupling networks, a knowledge graph, and a timeline of how those clusters have grown over time.
+Scholargraph is a local app that takes a single keyword and maps out an academic field. Most tools like Google Scholar or Semantic Scholar hand you a ranked list and call it done. Scholargraph treats that as a starting point. It follows citation links outward, using PageRank and semantic similarity to surface papers that sit at the structural core of the literature but would never appear on page one of a keyword search.
+
+The output isn't a list; it's a graph. Papers that cite each other heavily cluster together. Co-citation groups show which works share the same intellectual roots. Bibliographic coupling finds parallel research threads with no direct citation link between them at all. Influence metrics identify the papers that bridge sub-fields — not just the ones with the biggest citation counts. Everything exports in standard formats and caches locally, so iterative exploration is fast and the results don't depend on any proprietary platform to reproduce.
 
 ---
 
