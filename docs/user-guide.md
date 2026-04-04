@@ -188,6 +188,8 @@ When you click **▶ Run Pipeline**, the tool sends your query to the Semantic S
 
 The returned paper IDs are then sent to the batch metadata endpoint (`POST /paper/batch`) in chunks of up to 500 IDs at a time. This enriches each paper with its abstract, authors, venue, reference count, and fields of study.
 
+For papers where the batch endpoint returns no journal name, the pipeline makes an additional call to the title-match endpoint (`GET /paper/search/match`) using the paper's title. The journal name returned by that lookup is used to fill the gap. This fallback runs once per paper with a missing journal, so the number of extra API calls depends on how many papers lack venue data in the batch response.
+
 If **Apply year filter** is checked, papers outside the specified year range are dropped at this point.
 
 **Output:** `papers_df` — one row per paper. Key columns: `paper_id`, `title`, `year`, `citation_count`, `abstract`, `authors`, `venue`, `reference_count`, `fields_of_study`.
@@ -290,4 +292,4 @@ For each combination of publication year and cluster ID in `papers_df`, the pipe
 
 The pipeline enforces a minimum 1-second gap between API requests to stay within the Semantic Scholar unauthenticated rate limit (~1 req/sec). If the API returns HTTP 429 (rate limit exceeded), the client retries with exponential backoff: up to 4 attempts at 60 s, 120 s, and 240 s intervals.
 
-Paper metadata and reference lists are cached to disk in the `cache/` folder after each API call. On subsequent runs, cached papers and references are served from disk with no API request. The search query itself is never cached — search results are always fetched fresh.
+Paper metadata and reference lists are cached to disk in the `cache/` folder after each API call. On subsequent runs, cached papers and references are served from disk with no API request. The search query itself is never cached — search results are always fetched fresh. Journal names resolved via the title-match fallback are stored in the paper's cache entry, so the fallback call is not repeated on re-runs.

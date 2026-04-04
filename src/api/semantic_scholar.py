@@ -120,7 +120,7 @@ class SemanticScholarClient:
         When a DiskCache is attached, already-cached IDs are served from cache
         without any API request. Results are stored to cache after each batch.
 
-        Default fields: paperId, title, abstract, authors, year, venue,
+        Default fields: paperId, title, abstract, authors, year, journal, publicationVenue, venue,
                         citationCount, referenceCount, fieldsOfStudy
 
         Authors are flattened to a comma-separated string in `authors_str`.
@@ -129,7 +129,7 @@ class SemanticScholarClient:
         """
         if fields is None:
             fields = (
-                "paperId,title,abstract,authors,year,venue,"
+                "paperId,title,abstract,authors,year,journal,publicationVenue,venue,"
                 "citationCount,referenceCount,fieldsOfStudy"
             )
 
@@ -163,6 +163,14 @@ class SemanticScholarClient:
                 ) or None
                 paper["num_authors"] = len(raw_authors) if raw_authors else None
 
+                # Normalize journal: journal.name → publicationVenue.name → venue (legacy string)
+                _journal = paper.get("journal") or {}
+                _pub_venue = paper.get("publicationVenue") or {}
+                _legacy_venue = paper.get("venue")
+                paper["venue"] = (
+                    _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
+                )
+
                 pid = paper.get("paperId")
                 if pid:
                     fetched[pid] = paper
@@ -171,6 +179,25 @@ class SemanticScholarClient:
 
             if i + _BATCH_SIZE < len(uncached_ids):
                 time.sleep(_RATE_LIMIT_INTERVAL)
+
+        # Fallback: for papers with no venue, try /paper/search/match by title
+        for pid, paper in fetched.items():
+            if paper.get("venue") is not None:
+                continue
+            title = paper.get("title")
+            if not title:
+                continue
+            match = self.search_match(title)
+            if match is None:
+                continue
+            _journal = match.get("journal") or {}
+            _pub_venue = match.get("publicationVenue") or {}
+            _legacy_venue = match.get("venue")
+            resolved = _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
+            if resolved:
+                paper["venue"] = resolved
+                if self._cache is not None:
+                    self._cache.set_paper(pid, paper)
 
         # Persist new entries
         if self._cache is not None and fetched:
@@ -187,6 +214,33 @@ class SemanticScholarClient:
                 all_results.append({})
 
         return all_results
+
+    def search_match(
+        self,
+        title: str,
+        fields: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        GET /paper/search/match
+
+        Finds the single best-matching paper for an exact title query.
+        Returns the raw API dict (with a `matchScore` key), or None if no
+        match is found or the request fails.
+
+        Default fields: paperId,title,journal,publicationVenue,venue
+        """
+        if not title:
+            return None
+
+        if fields is None:
+            fields = "paperId,title,journal,publicationVenue,venue"
+
+        try:
+            data = self._get("/paper/search/match", params={"query": title, "fields": fields})
+        except RuntimeError:
+            return None
+
+        return data if data.get("paperId") else None
 
     def get_references(self, paper_id: str) -> List[dict]:
         """
