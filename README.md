@@ -1,3 +1,5 @@
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/271ab175-f927-430b-a6db-cca29550de67" />
+
 # Scholargraph — User Guide
 
 Scholargraph is a local app that takes a single keyword and maps out an academic field. Most tools like Google Scholar or Semantic Scholar hand you a ranked list and call it done. Scholargraph treats that as a starting point. It follows citation links outward, using PageRank and semantic similarity to surface papers that sit at the structural core of the literature but would never appear on page one of a keyword search.
