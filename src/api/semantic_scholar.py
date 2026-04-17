@@ -1,3 +1,4 @@
+import re
 import time
 import requests
 from typing import List, Optional
@@ -6,6 +7,11 @@ from typing import List, Optional
 BASE_URL = "https://api.semanticscholar.org/graph/v1"
 _RATE_LIMIT_INTERVAL = 1.0  # seconds between requests (unauthenticated tier)
 _BATCH_SIZE = 500            # max paper IDs per /paper/batch call
+
+_DOI_URL_PREFIXES = re.compile(
+    r"^https?://(?:dx\.)?doi\.org/",
+    re.IGNORECASE,
+)
 
 
 class SemanticScholarClient:
@@ -64,6 +70,20 @@ class SemanticScholarClient:
             )
         return response.json()
 
+    @staticmethod
+    def _normalize_doi(raw: Optional[str]) -> Optional[str]:
+        """
+        Normalize a raw DOI string to a bare token.
+
+        - Strips https://doi.org/, http://doi.org/, https://dx.doi.org/, etc.
+        - Strips surrounding whitespace and trailing punctuation.
+        - Returns None if result is empty.
+        """
+        if not raw:
+            return None
+        normalized = _DOI_URL_PREFIXES.sub("", raw).strip().rstrip(".")
+        return normalized if normalized else None
+
     # ------------------------------------------------------------------
     # Public API methods
     # ------------------------------------------------------------------
@@ -120,8 +140,12 @@ class SemanticScholarClient:
         When a DiskCache is attached, already-cached IDs are served from cache
         without any API request. Results are stored to cache after each batch.
 
-        Default fields: paperId, title, abstract, authors, year, journal, publicationVenue, venue,
+        Default fields: paperId, title, abstract, authors, year, journal,
+                        publicationVenue, venue, externalIds,
                         citationCount, referenceCount, fieldsOfStudy
+
+        Note: 'externalIds' is requested (not 'doi') — the standalone 'doi'
+        field causes a 400 error from the Semantic Scholar API.
 
         Authors are flattened to a comma-separated string in `authors_str`.
         Author count is stored in `num_authors`.
@@ -130,7 +154,7 @@ class SemanticScholarClient:
         if fields is None:
             fields = (
                 "paperId,title,abstract,authors,year,journal,publicationVenue,venue,"
-                "citationCount,referenceCount,fieldsOfStudy"
+                "externalIds,citationCount,referenceCount,fieldsOfStudy"
             )
 
         # Split into cached vs uncached when cache is available
@@ -171,6 +195,13 @@ class SemanticScholarClient:
                     _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
                 )
 
+                # Extract DOI from externalIds (do NOT request 'doi' field directly — causes 400)
+                ext_ids = paper.get("externalIds") or {}
+                raw_doi = ext_ids.get("DOI") or ext_ids.get("doi") or None
+                normalized_doi = self._normalize_doi(raw_doi)
+                paper["doi"] = normalized_doi
+                paper["doi_url"] = f"https://doi.org/{normalized_doi}" if normalized_doi else None
+
                 pid = paper.get("paperId")
                 if pid:
                     fetched[pid] = paper
@@ -180,9 +211,11 @@ class SemanticScholarClient:
             if i + _BATCH_SIZE < len(uncached_ids):
                 time.sleep(_RATE_LIMIT_INTERVAL)
 
-        # Fallback: for papers with no venue, try /paper/search/match by title
+        # Fallback: for papers missing venue or DOI, try /paper/search/match by title
         for pid, paper in fetched.items():
-            if paper.get("venue") is not None:
+            needs_venue = paper.get("venue") is None
+            needs_doi = paper.get("doi") is None
+            if not (needs_venue or needs_doi):
                 continue
             title = paper.get("title")
             if not title:
@@ -190,14 +223,25 @@ class SemanticScholarClient:
             match = self.search_match(title)
             if match is None:
                 continue
-            _journal = match.get("journal") or {}
-            _pub_venue = match.get("publicationVenue") or {}
-            _legacy_venue = match.get("venue")
-            resolved = _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
-            if resolved:
-                paper["venue"] = resolved
-                if self._cache is not None:
-                    self._cache.set_paper(pid, paper)
+
+            if needs_venue:
+                _journal = match.get("journal") or {}
+                _pub_venue = match.get("publicationVenue") or {}
+                _legacy_venue = match.get("venue")
+                resolved = _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
+                if resolved:
+                    paper["venue"] = resolved
+
+            if needs_doi:
+                ext_ids = match.get("externalIds") or {}
+                raw_doi = ext_ids.get("DOI") or ext_ids.get("doi") or None
+                normalized_doi = self._normalize_doi(raw_doi)
+                if normalized_doi:
+                    paper["doi"] = normalized_doi
+                    paper["doi_url"] = f"https://doi.org/{normalized_doi}"
+
+            if self._cache is not None:
+                self._cache.set_paper(pid, paper)
 
         # Persist new entries
         if self._cache is not None and fetched:
@@ -227,13 +271,13 @@ class SemanticScholarClient:
         Returns the raw API dict (with a `matchScore` key), or None if no
         match is found or the request fails.
 
-        Default fields: paperId,title,journal,publicationVenue,venue
+        Default fields: paperId,title,journal,publicationVenue,venue,externalIds
         """
         if not title:
             return None
 
         if fields is None:
-            fields = "paperId,title,journal,publicationVenue,venue"
+            fields = "paperId,title,journal,publicationVenue,venue,externalIds"
 
         try:
             data = self._get("/paper/search/match", params={"query": title, "fields": fields})

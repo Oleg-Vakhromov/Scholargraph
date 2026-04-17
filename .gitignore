@@ -1,11 +1,11 @@
-# Reference notebooks
-Bibliometrics_06032024.ipynb
+# Notebooks and dev notes
+*.ipynb
+dev_notes/
 
 # Framework / docs (not part of the public repo)
 .claude/
 .paul/
-README.md
-scopus_readme.md
+*.md
 scopus_api_search.py
 semantic_scholar_api_specs.json
 

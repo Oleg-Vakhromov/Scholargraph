@@ -10,7 +10,7 @@ Bibliometrics is a local Streamlit application for building and exploring academ
 - pip
 - Internet access (Semantic Scholar API + first-run model download)
 
-On first run, the sentence-transformers library downloads the `all-MiniLM-L6-v2` embedding model (~90 MB). This happens once and is cached locally afterward.
+On first run, the sentence-transformers library downloads the embedding model selected in the sidebar. The default **Fast** model (`all-MiniLM-L6-v2`) is ~90 MB. Larger models are downloaded only if selected. Downloads are cached locally and not repeated on subsequent runs.
 
 ---
 
@@ -78,6 +78,15 @@ How many high-PageRank candidate papers are evaluated per expansion iteration (r
 **Relevance threshold**
 Cosine similarity cutoff used to filter expansion candidates (range: 0.0–1.0, default: 0.3). Candidates whose title+abstract embedding scores below this threshold against the original query are discarded. Raise it (e.g., 0.5–0.7) if the expanded corpus feels off-topic; lower it if expansion is too conservative.
 
+**Embedding model**
+Controls which sentence-transformer model is used to embed paper titles and abstracts during relevance filtering. Three options are available:
+
+- **Fast (~90 MB)** — `all-MiniLM-L6-v2`. Default. Best for most queries. Fast to load; good quality for English academic text.
+- **Balanced / High quality (~420 MB)** — `all-mpnet-base-v2`. Higher semantic accuracy; noticeably slower to load on first use.
+- **Long-context multilingual (~2.2 GB)** — `BAAI/bge-m3`. Best for multilingual corpora or queries with long abstracts. Large download on first use.
+
+The selected model is downloaded and cached locally on first use. Switching models during a session loads a new cached instance without re-downloading.
+
 **▶ Run Pipeline**
 Starts Stage 1 (seeding). After seeding completes, a domain picker appears before the pipeline continues.
 
@@ -103,7 +112,7 @@ Results appear below the domain picker after the full pipeline completes. They a
 Two numbers at the top: total papers in the corpus and total citation edges. A quick sanity check before diving into the details.
 
 **Papers table**
-A sortable table listing every paper in the corpus with title, year, citation count, and authors. Sorted by citation count descending by default — the most globally-cited papers appear first.
+A sortable table listing every paper in the corpus with title, year, journal, citation count, authors, and a **DOI** column (↗ link). Sorted by citation count descending by default — the most globally-cited papers appear first. Papers with a known DOI show a clickable link to the publisher page; papers with no DOI show an empty cell.
 
 **Influential Papers**
 Papers ranked by in-sample citation metrics — how often they are cited by other papers *within this corpus*, not just globally. Columns:
@@ -112,6 +121,7 @@ Papers ranked by in-sample citation metrics — how often they are cited by othe
 - **isc_ratio** — isc as a percentage of the paper's total Semantic Scholar citations (capped at 100 %). A high ratio means this paper is especially central to this specific literature
 - **sample_relevance** — isc as a percentage of total corpus size: what fraction of the corpus cites this paper
 - **betweenness_centrality** — how often this paper lies on the shortest path between other papers in the citation graph. High betweenness means the paper bridges otherwise-disconnected research clusters
+- **DOI** — clickable link (↗) to the publisher page, when available
 
 **Co-citation Analysis**
 Papers that are frequently cited together by the same sources are likely intellectually related, even if they do not cite each other directly. This panel shows a network where:
@@ -151,10 +161,11 @@ An interactive node-link diagram of the corpus. Each node is a paper; edges are 
 A line chart showing how many papers per cluster were published in each year. Each line is a cluster, labeled by its keyword label. Use this to spot which research streams are growing, stable, or declining — and when new streams emerged.
 
 **Export**
-Three download buttons for taking the corpus elsewhere:
+Four download buttons for taking the corpus elsewhere:
 - **papers.csv** — full corpus metadata (one row per paper)
 - **citations.csv** — citation edge list (source → target)
 - **graph.graphml** — the citation graph in GraphML format, compatible with Gephi, Cytoscape, and NetworkX
+- **papers.bib** — BibTeX export of the full corpus. Each entry includes title, authors, year, journal, DOI, and a `keywords` field containing `cluster:<label>` (e.g., `cluster:machine learning`). Import into Zotero to recreate corpus clusters as Zotero collections using the keyword filter.
 
 ---
 
@@ -170,9 +181,11 @@ Three download buttons for taking the corpus elsewhere:
 
 - **Raise the edge threshold in dense networks.** If the co-citation or bibliographic coupling network is too tangled to read, increase the **Min co-citations** or **Min shared references** slider. Start at 3–5 for a corpus of several hundred papers.
 
-- **The cache speeds up repeated runs.** Paper metadata and references are cached to disk in the `cache/` folder. Re-running the same query with the same papers will be significantly faster on subsequent runs.
+- **The cache speeds up repeated runs.** Paper metadata and references are cached to a single file (`cache/semantic_scholar_cache.json`). Re-running the same query with the same papers will be significantly faster on subsequent runs. The cache is written atomically — interrupted runs do not corrupt it.
 
 - **Use GraphML for deeper analysis.** The exported `graph.graphml` file can be opened in Gephi for advanced layout algorithms, filtering, and centrality calculations not available in the built-in graph view.
+
+- **Use BibTeX export with Zotero to recreate clusters.** Download `papers.bib` and import it into Zotero. Each entry carries a `keywords` field with its cluster label (e.g., `cluster:behavioral finance`). Use Zotero's search to filter by keyword and create a collection per cluster — you get the Scholargraph cluster structure inside your reference manager.
 
 - **Year filter applies to the seed only.** The expansion phase may pull in papers outside the year range if they are highly connected to the corpus. If strict year bounds matter, post-filter `papers.csv` after export.
 
@@ -189,6 +202,8 @@ When you click **▶ Run Pipeline**, the tool sends your query to the Semantic S
 The returned paper IDs are then sent to the batch metadata endpoint (`POST /paper/batch`) in chunks of up to 500 IDs at a time. This enriches each paper with its abstract, authors, venue, reference count, and fields of study.
 
 For papers where the batch endpoint returns no journal name, the pipeline makes an additional call to the title-match endpoint (`GET /paper/search/match`) using the paper's title. The journal name returned by that lookup is used to fill the gap. This fallback runs once per paper with a missing journal, so the number of extra API calls depends on how many papers lack venue data in the batch response.
+
+The batch response also returns the paper's DOI via its external identifier list. A normalized DOI token (`doi`) and a full URL (`doi_url = https://doi.org/{doi}`) are extracted for each paper. If the DOI is missing from the batch response, the title-match fallback call is used to resolve it as well — a single fallback call covers both missing journal and missing DOI.
 
 If **Apply year filter** is checked, papers outside the specified year range are dropped at this point.
 
@@ -292,4 +307,4 @@ For each combination of publication year and cluster ID in `papers_df`, the pipe
 
 The pipeline enforces a minimum 1-second gap between API requests to stay within the Semantic Scholar unauthenticated rate limit (~1 req/sec). If the API returns HTTP 429 (rate limit exceeded), the client retries with exponential backoff: up to 4 attempts at 60 s, 120 s, and 240 s intervals.
 
-Paper metadata and reference lists are cached to disk in the `cache/` folder after each API call. On subsequent runs, cached papers and references are served from disk with no API request. The search query itself is never cached — search results are always fetched fresh. Journal names resolved via the title-match fallback are stored in the paper's cache entry, so the fallback call is not repeated on re-runs.
+Paper metadata and reference lists are cached to a single file (`cache/semantic_scholar_cache.json`) after each API call. Writes are atomic (temp file + rename) so an interrupted run cannot corrupt the cache. On subsequent runs, cached papers and references are served from disk with no API request. The search query itself is never cached — search results are always fetched fresh. Journal names resolved via the title-match fallback are stored in the paper's cache entry, so the fallback call is not repeated on re-runs.
