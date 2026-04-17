@@ -7,14 +7,58 @@ from src.analysis.scimago import ScimagoLoader
 _scimago = ScimagoLoader()
 _scimago.load("data/scimago.csv")
 
+
+def _generate_bibtex(papers_df, cluster_labels=None):
+    """Generate BibTeX string for all papers in the corpus."""
+    import re
+    entries = []
+    labels = cluster_labels or {}
+
+    for _, row in papers_df.iterrows():
+        # BibTeX key: paper_id sanitized to alphanumeric + underscores
+        key = re.sub(r"[^A-Za-z0-9_]", "_", str(row.get("paper_id") or "unknown"))
+
+        # Cluster tag
+        cid = row.get("cluster_id")
+        if cid is not None and not (isinstance(cid, float) and pd.isna(cid)):
+            cid_int = int(cid)
+            label = labels.get(cid_int, f"cluster_{cid_int}")
+            keywords = f"cluster:{label}"
+        else:
+            keywords = ""
+
+        def _bib_escape(s):
+            if not s:
+                return ""
+            return str(s).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+        fields = [f"  title = {{{_bib_escape(row.get('title'))}}}"]
+        if row.get("authors"):
+            fields.append(f"  author = {{{_bib_escape(row.get('authors'))}}}")
+        if row.get("year") and not (isinstance(row.get("year"), float) and pd.isna(row.get("year"))):
+            fields.append(f"  year = {{{int(row['year'])}}}")
+        if row.get("journal"):
+            fields.append(f"  journal = {{{_bib_escape(row.get('journal'))}}}")
+        if row.get("doi"):
+            fields.append(f"  doi = {{{_bib_escape(row.get('doi'))}}}")
+        if row.get("doi_url"):
+            fields.append(f"  url = {{{_bib_escape(row.get('doi_url'))}}}")
+        if keywords:
+            fields.append(f"  keywords = {{{keywords}}}")
+
+        entry = f"@article{{{key},\n" + ",\n".join(fields) + "\n}"
+        entries.append(entry)
+
+    return "\n\n".join(entries)
+
 # ---------------------------------------------------------------------------
 # Cached resource loaders — loaded once, reused across reruns
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
-def _load_filter():
+def _load_filter(model_name: str = "all-MiniLM-L6-v2"):
     from src.expansion.filter import RelevanceFilter
-    return RelevanceFilter()
+    return RelevanceFilter(model_name=model_name)
 
 
 @st.cache_resource
@@ -105,6 +149,21 @@ with st.sidebar:
     relevance_threshold = st.slider(
         "Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05
     )
+
+    st.divider()
+    st.subheader("Embedding Model")
+    _MODEL_OPTIONS = {
+        "Fast (~90 MB)": "all-MiniLM-L6-v2",
+        "Balanced / High quality (~420 MB)": "all-mpnet-base-v2",
+        "Long-context multilingual (~2.2 GB)": "BAAI/bge-m3",
+    }
+    selected_model_label = st.selectbox(
+        "Embedding model",
+        options=list(_MODEL_OPTIONS.keys()),
+        index=0,
+        help="Controls relevance filtering during expansion. Faster models use less memory; larger models improve filtering quality for broad or multilingual queries.",
+    )
+    selected_model = _MODEL_OPTIONS[selected_model_label]
 
     run_button = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
 
@@ -221,7 +280,7 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
 
             # Expand
             _log("Expanding corpus...")
-            expander = CorpusExpander(corpus._client, GraphEngine(), _load_filter())
+            expander = CorpusExpander(corpus._client, GraphEngine(), _load_filter(selected_model))
 
             def _report_iteration(iteration, seed_count, refs_extracted, new_papers):
                 _log(
@@ -283,13 +342,16 @@ if st.session_state["papers_df"] is not None:
     st.subheader("Papers")
     st.caption("All papers collected during seeding and expansion, ranked by citation count. Higher citation counts indicate greater influence in the field.")
     display_cols = [
-        c for c in ["title", "year", "journal", "citation_count", "authors"]
+        c for c in ["title", "year", "journal", "citation_count", "authors", "doi_url"]
         if c in papers_df.columns
     ]
     st.dataframe(
         papers_df[display_cols].sort_values("citation_count", ascending=False),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "doi_url": st.column_config.LinkColumn("DOI", display_text="↗"),
+        },
     )
 
     # -----------------------------------------------------------------------
@@ -319,7 +381,7 @@ if st.session_state["papers_df"] is not None:
     _inf_cols = [
         c for c in [
             "title", "year", "journal", "citation_count",
-            "isc", "isc_ratio", "sample_relevance", "betweenness_centrality",
+            "isc", "isc_ratio", "sample_relevance", "betweenness_centrality", "doi_url",
         ]
         if c in _inf_display.columns
     ]
@@ -327,6 +389,9 @@ if st.session_state["papers_df"] is not None:
         _inf_display[_inf_cols].sort_values("isc", ascending=False),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "doi_url": st.column_config.LinkColumn("DOI", display_text="↗"),
+        },
     )
 
     # -----------------------------------------------------------------------
@@ -638,7 +703,7 @@ if st.session_state["papers_df"] is not None:
     import networkx as nx
     from src.graph.engine import GraphEngine
 
-    exp_col1, exp_col2, exp_col3 = st.columns(3)
+    exp_col1, exp_col2, exp_col3, exp_col4 = st.columns(4)
 
     papers_csv = st.session_state["papers_df"].to_csv(index=False).encode("utf-8")
     exp_col1.download_button(
@@ -667,6 +732,17 @@ if st.session_state["papers_df"] is not None:
         data=_graphml_buf.getvalue(),
         file_name="graph.graphml",
         mime="application/xml",
+    )
+
+    _bibtex_str = _generate_bibtex(
+        st.session_state["papers_df"],
+        st.session_state.get("cluster_labels"),
+    )
+    exp_col4.download_button(
+        "⬇ papers.bib",
+        data=_bibtex_str.encode("utf-8"),
+        file_name="papers.bib",
+        mime="text/plain",
     )
 
 else:

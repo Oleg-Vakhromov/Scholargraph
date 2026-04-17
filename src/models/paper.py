@@ -18,6 +18,8 @@ class Paper:
     citation_count: int
     reference_count: Optional[int]
     fields_of_study: Optional[List[str]]
+    doi: Optional[str]               # bare DOI token, e.g. "10.1234/example"
+    doi_url: Optional[str]           # full URL, e.g. "https://doi.org/10.1234/example"
 
     @classmethod
     def from_api_dict(cls, d: dict) -> Paper:
@@ -26,6 +28,7 @@ class Paper:
 
         Handles camelCase → snake_case mapping and missing/None fields gracefully.
         Expects `authors_str` and `num_authors` keys as pre-processed by the client.
+        Expects `doi` and `doi_url` keys pre-processed by the client from externalIds.
         """
         return cls(
             paper_id=d.get("paperId") or "",
@@ -38,6 +41,8 @@ class Paper:
             citation_count=d.get("citationCount") or 0,
             reference_count=d.get("referenceCount"),
             fields_of_study=d.get("fieldsOfStudy"),
+            doi=d.get("doi"),
+            doi_url=d.get("doi_url"),
         )
 
 
@@ -64,7 +69,7 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
 
     Columns (in order):
         paper_id, title, abstract, authors, num_authors, year, journal,
-        citation_count, reference_count, fields_of_study
+        citation_count, reference_count, fields_of_study, doi, doi_url
 
     dtypes:
         year            → Int64  (pandas nullable integer — supports NaN)
@@ -83,6 +88,8 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
             "citation_count": p.citation_count,
             "reference_count": p.reference_count,
             "fields_of_study": p.fields_of_study,
+            "doi": p.doi,
+            "doi_url": p.doi_url,
         }
         for p in papers
     ]
@@ -91,7 +98,8 @@ def papers_to_df(papers: List[Paper]) -> pd.DataFrame:
         records,
         columns=[
             "paper_id", "title", "abstract", "authors", "num_authors",
-            "year", "journal", "citation_count", "reference_count", "fields_of_study",
+            "year", "journal", "citation_count", "reference_count",
+            "fields_of_study", "doi", "doi_url",
         ],
     )
 
@@ -120,5 +128,4 @@ def citations_to_df(citations: List[Citation]) -> pd.DataFrame:
 
     df = pd.DataFrame(records, columns=["source", "target", "title", "year"])
     df["year"] = df["year"].astype("Int64")
-
     return df

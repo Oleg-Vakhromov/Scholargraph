@@ -254,6 +254,11 @@ class CorpusBuilder:
         if "citation_count" in df.columns:
             df["citation_count"] = df["citation_count"].fillna(0).astype("int64")
 
+        # Ensure doi/doi_url columns exist for CSVs saved before Phase 15
+        for col in ("doi", "doi_url"):
+            if col not in df.columns:
+                df[col] = None
+
         self.papers_df = df
         return self.papers_df
 
