@@ -51,6 +51,30 @@ def _generate_bibtex(papers_df, cluster_labels=None):
 
     return "\n\n".join(entries)
 
+
+def _graph_tab_button(net, html, col, file_name):
+    """Render an 'Open in new tab' button using window.open + document.write.
+    HTML is base64-encoded inside a <script> tag to avoid attribute quoting issues
+    and Chrome's data: URI navigation restriction."""
+    import base64 as _b64
+    import streamlit.components.v1 as _components
+    b64 = _b64.b64encode(html.encode("utf-8")).decode("ascii")
+    fn = "openGraph_" + file_name.replace(".", "_").replace("-", "_")
+    btn_html = (
+        f"<script>function {fn}(){{"
+        f"var bytes=Uint8Array.from(atob('{b64}'),function(c){{return c.charCodeAt(0);}});"
+        f"var h=new TextDecoder('utf-8').decode(bytes);"
+        f"var w=window.open('','_blank');"
+        f"if(w){{w.document.open();w.document.write(h);w.document.close();}}"
+        f"}}</script>"
+        f"<button onclick='{fn}()' style='padding:4px 12px;border-radius:4px;"
+        f"border:1px solid #999;cursor:pointer;background:#fff;"
+        f"font-size:14px;font-family:sans-serif;color:#333'>"
+        f"Open in new tab ↗</button>"
+    )
+    with col:
+        _components.html(btn_html, height=44)
+
 # ---------------------------------------------------------------------------
 # Cached resource loaders — loaded once, reused across reruns
 # ---------------------------------------------------------------------------
@@ -120,6 +144,10 @@ if "bibcoupling_df" not in st.session_state:
     st.session_state["bibcoupling_df"] = None
 if "bibcoupling_clusters" not in st.session_state:
     st.session_state["bibcoupling_clusters"] = None
+if "node_size_scale" not in st.session_state:
+    st.session_state["node_size_scale"] = 1.0
+if "sentinel_loaded" not in st.session_state:
+    st.session_state["sentinel_loaded"] = False
 
 # ---------------------------------------------------------------------------
 # Sidebar — pipeline parameters
@@ -167,6 +195,17 @@ with st.sidebar:
 
     run_button = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
 
+    _SENTINEL_PAPERS = Path("data/sentinel/papers.json")
+    if _SENTINEL_PAPERS.exists():
+        st.divider()
+        load_sentinel_button = st.button(
+            "Load Analyzed Graph",
+            help="Load pre-analyzed graph from the Sentinel pipeline (data/sentinel/)",
+            use_container_width=True,
+        )
+    else:
+        load_sentinel_button = False
+
 # ---------------------------------------------------------------------------
 # Stage 1 — Seed corpus only
 # ---------------------------------------------------------------------------
@@ -195,6 +234,7 @@ if run_button:
         st.session_state["cocitation_clusters"] = None
         st.session_state["bibcoupling_df"] = None
         st.session_state["bibcoupling_clusters"] = None
+        st.session_state["node_size_scale"] = 1.0
 
         year_range = (int(year_min), int(year_max)) if use_year_filter else None
 
@@ -213,6 +253,27 @@ if run_button:
         st.session_state["corpus"] = corpus
         st.session_state["available_domains"] = corpus.extract_domains()
         st.session_state["seed_done"] = True
+
+if load_sentinel_button:
+    from src.sentinel.data_loader import SentinelDataLoader
+    with st.status("Loading Sentinel graph...", expanded=True) as _status:
+        _sentinel = SentinelDataLoader().load()
+        st.session_state["papers_df"] = _sentinel["papers_df"]
+        st.session_state["citations_df"] = _sentinel["citations_df"]
+        st.session_state["partition"] = _sentinel["partition"]
+        st.session_state["cluster_labels"] = None
+        st.session_state["cluster_summary"] = None
+        st.session_state["cluster_params"] = None
+        st.session_state["corpus"] = None
+        st.session_state["seed_done"] = True
+        st.session_state["sentinel_loaded"] = True
+        st.session_state["influence_df"] = None
+        st.session_state["cocitation_df"] = None
+        st.session_state["cocitation_clusters"] = None
+        st.session_state["bibcoupling_df"] = None
+        st.session_state["bibcoupling_clusters"] = None
+        st.write(f"Loaded {len(_sentinel['papers_df'])} papers, {len(_sentinel['citations_df'])} edges")
+        _status.update(label="Sentinel graph loaded", state="complete")
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Domain picker and pipeline continuation
@@ -335,9 +396,32 @@ if st.session_state["papers_df"] is not None:
         "#1abc9c", "#e67e22", "#34495e", "#e91e63", "#00bcd4",
     ]
 
+    _LAYER_COLORS = {
+        "Spearhead":       "#e74c3c",
+        "Foundational":    "#3498db",
+        "Theory Extender": "#9b59b6",
+        "Standard":        "#95a5a6",
+    }
+
     col1, col2 = st.columns(2)
     col1.metric("Total papers", len(papers_df))
     col2.metric("Total citations", len(citations_df) if citations_df is not None else 0)
+
+    if "local_citation_count" in papers_df.columns:
+        with st.sidebar:
+            st.divider()
+            st.subheader("Ranked List")
+            st.caption("Sorted by local citation index (LCI), then global citations.")
+            _ranked = (
+                papers_df[["title", "local_citation_count", "citation_count"]]
+                .sort_values(["local_citation_count", "citation_count"], ascending=[False, False])
+                .reset_index(drop=True)
+                .head(20)
+            )
+            _ranked.index = _ranked.index + 1
+            _ranked.columns = ["Title", "LCI", "Global Citations"]
+            _ranked["Title"] = _ranked["Title"].apply(lambda t: (str(t) or "")[:40])
+            st.dataframe(_ranked, use_container_width=True)
 
     st.subheader("Papers")
     st.caption("All papers collected during seeding and expansion, ranked by citation count. Higher citation counts indicate greater influence in the field.")
@@ -393,6 +477,48 @@ if st.session_state["papers_df"] is not None:
             "doi_url": st.column_config.LinkColumn("DOI", display_text="↗"),
         },
     )
+    _inf_csv = _inf_display[_inf_cols].sort_values("isc", ascending=False).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Download influential papers",
+        data=_inf_csv,
+        file_name="influential_papers.csv",
+        mime="text/csv",
+    )
+
+    # -----------------------------------------------------------------------
+    # Graph Display Settings
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("Graph Display Settings")
+    st.caption("Node size metric and scale apply to all graph visualisations below.")
+
+    _gds_col1, _gds_col2, _gds_col3 = st.columns([4, 1, 1])
+    _node_size_metric = _gds_col1.selectbox(
+        "Node size metric",
+        options=["isc", "citation_count", "isc_ratio", "sample_relevance", "betweenness_centrality"],
+        index=0,
+        key="node_size_metric",
+    )
+    _gds_col2.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
+    if _gds_col2.button("－ Size"):
+        st.session_state["node_size_scale"] = max(st.session_state["node_size_scale"] / 1.3, 0.1)
+    _gds_col3.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
+    if _gds_col3.button("＋ Size"):
+        st.session_state["node_size_scale"] = min(st.session_state["node_size_scale"] * 1.3, 10.0)
+    _node_scale = st.session_state["node_size_scale"]
+
+    # Build metric lookup from influence_df (covers all paper_ids in corpus)
+    _inf_for_sizing = st.session_state["influence_df"]
+    if _inf_for_sizing is not None and _node_size_metric in _inf_for_sizing.columns:
+        _metric_lookup = dict(zip(_inf_for_sizing["paper_id"], _inf_for_sizing[_node_size_metric].fillna(0)))
+        _metric_max = float(max(_inf_for_sizing[_node_size_metric].fillna(0).max(), 1e-9))
+    else:
+        _metric_lookup = {}
+        _metric_max = 1.0
+
+    def _sized(paper_id):
+        val = _metric_lookup.get(paper_id, 0)
+        return float(max((10 + 30 * (val / _metric_max)) * _node_scale, 5))
 
     # -----------------------------------------------------------------------
     # Co-citation Analysis
@@ -451,8 +577,8 @@ if st.session_state["papers_df"] is not None:
         _coc_net = Network(
             height="500px",
             width="100%",
-            bgcolor="#0e1117",
-            font_color="white",
+            bgcolor="#e8e8e8",
+            font_color="#222222",
             directed=False,
         )
         _coc_net.barnes_hut()
@@ -468,7 +594,7 @@ if st.session_state["papers_df"] is not None:
                 label=_label,
                 title=_title_lookup.get(_pid) or _pid,
                 color=_color,
-                size=15,
+                size=_sized(_pid),
             )
 
         for _, _edge in _coc_filtered.iterrows():
@@ -481,6 +607,26 @@ if st.session_state["papers_df"] is not None:
 
         _coc_html = _coc_net.generate_html()
         components.html(_coc_html, height=510, scrolling=False)
+
+        _coc_btn_col1, _coc_btn_col2 = st.columns(2)
+        _graph_tab_button(_coc_net, _coc_html, _coc_btn_col1, "cocitation_graph.html")
+
+        _coc_export_rows = [
+            {
+                "cluster_from": _coc_clusters.get(_e["paper_a"], -1),
+                "from_paper_name": _title_lookup.get(_e["paper_a"], _e["paper_a"]),
+                "cluster_to": _coc_clusters.get(_e["paper_b"], -1),
+                "to_paper_name": _title_lookup.get(_e["paper_b"], _e["paper_b"]),
+            }
+            for _, _e in _coc_filtered.iterrows()
+        ]
+        _coc_btn_col2.download_button(
+            "⬇ Export view as CSV",
+            data=pd.DataFrame(_coc_export_rows).to_csv(index=False).encode("utf-8"),
+            file_name="cocitation_view.csv",
+            mime="text/csv",
+            key="cocit_export_csv",
+        )
 
     # -----------------------------------------------------------------------
     # Bibliographic Coupling
@@ -537,8 +683,8 @@ if st.session_state["papers_df"] is not None:
         _bib_net = Network(
             height="500px",
             width="100%",
-            bgcolor="#0e1117",
-            font_color="white",
+            bgcolor="#e8e8e8",
+            font_color="#222222",
             directed=False,
         )
         _bib_net.barnes_hut()
@@ -553,7 +699,7 @@ if st.session_state["papers_df"] is not None:
                 label=_label,
                 title=_title_lookup_bib.get(_pid) or _pid,
                 color=_color,
-                size=15,
+                size=_sized(_pid),
             )
 
         for _, _edge in _bib_filtered.iterrows():
@@ -566,6 +712,26 @@ if st.session_state["papers_df"] is not None:
 
         _bib_html = _bib_net.generate_html()
         components.html(_bib_html, height=510, scrolling=False)
+
+        _bib_btn_col1, _bib_btn_col2 = st.columns(2)
+        _graph_tab_button(_bib_net, _bib_html, _bib_btn_col1, "bibcoupling_graph.html")
+
+        _bib_export_rows = [
+            {
+                "cluster_from": _bib_clusters.get(_e["paper_a"], -1),
+                "from_paper_name": _title_lookup_bib.get(_e["paper_a"], _e["paper_a"]),
+                "cluster_to": _bib_clusters.get(_e["paper_b"], -1),
+                "to_paper_name": _title_lookup_bib.get(_e["paper_b"], _e["paper_b"]),
+            }
+            for _, _e in _bib_filtered.iterrows()
+        ]
+        _bib_btn_col2.download_button(
+            "⬇ Export view as CSV",
+            data=pd.DataFrame(_bib_export_rows).to_csv(index=False).encode("utf-8"),
+            file_name="bibcoupling_view.csv",
+            mime="text/csv",
+            key="bib_export_csv",
+        )
 
     # -----------------------------------------------------------------------
     # Cluster analysis
@@ -620,7 +786,7 @@ if st.session_state["papers_df"] is not None:
     # -----------------------------------------------------------------------
     st.divider()
     st.subheader("Knowledge Graph")
-    st.caption("Citation network visualisation. Node size reflects citation count; node colour reflects cluster membership. Edges point from citing paper to cited paper.")
+    st.caption("Citation network visualisation. Node size reflects the selected metric; node colour reflects cluster membership. Edges point from citing paper to cited paper.")
 
     max_nodes = st.slider(
         "Max nodes", min_value=20, max_value=500, value=100, step=20,
@@ -639,24 +805,30 @@ if st.session_state["papers_df"] is not None:
 
     net = Network(
         height="650px", width="100%",
-        bgcolor="#0e1117", font_color="white",
+        bgcolor="#e8e8e8", font_color="#222222",
         directed=True,
     )
     net.barnes_hut()
 
-    max_cit = max(papers_for_graph["citation_count"].max(), 1)
-
     for _, row in papers_for_graph.iterrows():
-        cid = int(row["cluster_id"]) if pd.notna(row.get("cluster_id")) else -1
-        color = _PALETTE[cid % len(_PALETTE)] if cid >= 0 else "#888888"
-        size = 10 + 30 * (row["citation_count"] / max_cit)
+        if "layer_tag" in papers_for_graph.columns:
+            color = _LAYER_COLORS.get(row.get("layer_tag"), "#888888")
+        else:
+            cid = int(row["cluster_id"]) if pd.notna(row.get("cluster_id")) else -1
+            color = _PALETTE[cid % len(_PALETTE)] if cid >= 0 else "#888888"
+        size = _sized(row["paper_id"])
         label = (row["title"] or "")[:40]
         net.add_node(
             row["paper_id"],
             label=label,
-            title=f"{row['title']}\nYear: {row.get('year', '?')}\nCitations: {row['citation_count']}",
+            title=(
+                f"{row['title']}\n"
+                f"Year: {row.get('year', '?')}\n"
+                f"Citations: {row.get('citation_count', '?')}"
+                + (f"\nLayer: {row['layer_tag']}" if "layer_tag" in papers_for_graph.columns and pd.notna(row.get("layer_tag")) else "")
+            ),
             color=color,
-            size=float(size),
+            size=size,
         )
 
     citations_df = st.session_state["citations_df"]
@@ -667,6 +839,30 @@ if st.session_state["papers_df"] is not None:
 
     html = net.generate_html()
     components.html(html, height=660, scrolling=False)
+
+    _kg_btn_col1, _kg_btn_col2 = st.columns(2)
+    _graph_tab_button(net, html, _kg_btn_col1, "knowledge_graph.html")
+
+    _kg_pid_cluster = dict(zip(papers_for_graph["paper_id"], papers_for_graph["cluster_id"].fillna(-1).astype(int)))
+    _kg_pid_title = dict(zip(papers_for_graph["paper_id"], papers_for_graph["title"]))
+    _kg_export_rows = [
+        {
+            "cluster_from": _kg_pid_cluster.get(edge["source"], -1),
+            "from_paper_name": _kg_pid_title.get(edge["source"], edge["source"]),
+            "cluster_to": _kg_pid_cluster.get(edge["target"], -1),
+            "to_paper_name": _kg_pid_title.get(edge["target"], edge["target"]),
+        }
+        for _, edge in citations_df.iterrows()
+        if citations_df is not None and edge["source"] in node_ids and edge["target"] in node_ids
+    ] if citations_df is not None and not citations_df.empty else []
+    if _kg_export_rows:
+        _kg_btn_col2.download_button(
+            "⬇ Export view as CSV",
+            data=pd.DataFrame(_kg_export_rows).to_csv(index=False).encode("utf-8"),
+            file_name="knowledge_graph_view.csv",
+            mime="text/csv",
+            key="kg_export_csv",
+        )
 
     # -----------------------------------------------------------------------
     # Temporal Evolution

@@ -6,6 +6,27 @@ The output isn't a list; it's a graph. Papers that cite each other heavily clust
 
 ---
 
+## Changelog
+
+### April 2026 — Graph display and export improvements
+
+- **Graph backgrounds** — All three network visualisations (co-citation, bibliographic coupling, knowledge graph) now use a light-grey background for better readability in bright environments.
+- **Node size metric** — A new **Graph Display Settings** panel lets you choose which metric drives node size across all graphs: in-sample citations (`isc`, default), global citation count, ISC ratio, sample relevance, or betweenness centrality.
+- **Node size scaling** — Two buttons (**＋ Size** / **－ Size**) scale all nodes up or down proportionally without changing their relative sizes.
+- **Open graph in new tab** — Each graph now has an **Open in new tab ↗** button that opens a fully self-contained HTML version of the current graph in a separate browser tab.
+- **Export graph view as CSV** — Each graph has an **Export view as CSV** button that downloads the currently visible edges (after threshold filtering) with columns: `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`.
+- **Download influential papers** — A download button below the Influential Papers table exports it to CSV directly.
+
+### Earlier — Cache, DOI enrichment, embedding models, BibTeX export (Anton Moiseev)
+
+- **Persistent disk cache** — Paper metadata and reference lists are cached to `cache/semantic_scholar_cache.json` with atomic writes and retry logic (safe on Windows and OneDrive). Repeated runs re-use cached data with no API calls.
+- **DOI enrichment** — DOI is extracted from the `externalIds` field in the Semantic Scholar batch response. If missing, a title-match fallback call resolves it. A normalised DOI token and full `https://doi.org/` URL are stored per paper and propagated through all corpus outputs.
+- **Clickable DOI links** — Title rows in the Papers and Influential Papers tables include a **DOI ↗** link column that opens the publisher page when a DOI is available.
+- **Embedding model selector** — The sidebar offers three sentence-transformer models for relevance filtering: Fast / ~90 MB (`all-MiniLM-L6-v2`, default), Balanced / ~420 MB (`all-mpnet-base-v2`), and Long-context multilingual / ~2.2 GB (`BAAI/bge-m3`). The selected model is downloaded once and cached locally.
+- **BibTeX export with Zotero cluster tags** — The Export section includes a `papers.bib` download. Each entry carries a `keywords` field in the form `cluster:<label>`, allowing Zotero users to recreate the corpus cluster structure as Zotero collections using the keyword filter.
+
+---
+
 ## Prerequisites
 
 - Python 3.10 or higher
@@ -125,16 +146,29 @@ Papers ranked by in-sample citation metrics — how often they are cited by othe
 - **betweenness_centrality** — how often this paper lies on the shortest path between other papers in the citation graph. High betweenness means the paper bridges otherwise-disconnected research clusters
 - **DOI** — clickable link (↗) to the publisher page, when available
 
+A **⬇ Download influential papers** button below the table exports the current view to CSV.
+
+**Graph Display Settings**
+A shared control panel that applies to all three network graphs below it.
+
+- **Node size metric** — selects which value drives node size across all graphs. Options: `isc` (default), `citation_count`, `isc_ratio`, `sample_relevance`, `betweenness_centrality`. Changing the metric rerenders all graphs on the next interaction.
+- **＋ Size / － Size** — scale all nodes up or down by a fixed factor while preserving their relative sizes. Each click multiplies or divides the global scale by 1.3.
+
 **Co-citation Analysis**
 Papers that are frequently cited together by the same sources are likely intellectually related, even if they do not cite each other directly. This panel shows a network where:
 
 - Nodes are corpus papers that appear in at least one co-citation pair
 - Edges connect paper pairs cited together, with edge thickness proportional to co-citation count
 - Node colour reflects cluster membership from AgglomerativeClustering applied to the co-citation similarity matrix
+- Node size reflects the metric selected in **Graph Display Settings**
 
 Two controls adjust the view:
 - **Co-citation clusters** — number of clusters to detect (default: matches the Louvain cluster count, capped at 20)
 - **Min co-citations (edge threshold)** — minimum times two papers must be co-cited for an edge to appear (default: 2). Raise this to declutter dense networks
+
+Below the graph, two buttons are available:
+- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
+- **⬇ Export view as CSV** — downloads the currently visible edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
 
 **Bibliographic Coupling**
 Papers that cite the same sources share intellectual foundations and are likely working in the same research area. This panel shows a network where:
@@ -142,10 +176,15 @@ Papers that cite the same sources share intellectual foundations and are likely 
 - Nodes are corpus papers that share at least one reference with another corpus paper
 - Edges connect paper pairs with shared references, with edge thickness proportional to the number of shared references
 - Node colour reflects cluster membership from AgglomerativeClustering applied to the coupling strength matrix
+- Node size reflects the metric selected in **Graph Display Settings**
 
 Two controls adjust the view:
 - **Coupling clusters** — number of clusters to detect
 - **Min shared references (edge threshold)** — minimum shared references required for an edge to appear (default: 2)
+
+Below the graph, two buttons are available:
+- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
+- **⬇ Export view as CSV** — downloads the currently visible edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
 
 **Clusters**
 Research clusters detected automatically via Louvain community detection on the citation graph. Displays a summary table with:
@@ -157,7 +196,11 @@ Research clusters detected automatically via Louvain community detection on the 
 Clusters represent topical sub-communities within the corpus. A cluster with many papers and high citation counts for its top paper is likely a core research stream.
 
 **Knowledge Graph**
-An interactive node-link diagram of the corpus. Each node is a paper; edges are citation links (A → B means A cites B). Nodes are sized by citation count and colored by Louvain cluster. Use the **Max nodes** slider above the graph to control how many papers are shown (top N by citation count). Pan and zoom with the mouse.
+An interactive node-link diagram of the corpus. Each node is a paper; edges are citation links (A → B means A cites B). Node size reflects the metric selected in **Graph Display Settings**; node colour reflects Louvain cluster. Use the **Max nodes** slider above the graph to control how many papers are shown (top N by citation count). Pan and zoom with the mouse.
+
+Below the graph, two buttons are available:
+- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
+- **⬇ Export view as CSV** — downloads the currently visible citation edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
 
 **Temporal Evolution**
 A line chart showing how many papers per cluster were published in each year. Each line is a cluster, labeled by its keyword label. Use this to spot which research streams are growing, stable, or declining — and when new streams emerged.
@@ -182,6 +225,10 @@ Four download buttons for taking the corpus elsewhere:
 - **Compare co-citation and bibliographic coupling clusters to Louvain clusters.** The three clustering methods capture different notions of proximity. Louvain uses direct citation links; co-citation groups papers cited together; bibliographic coupling groups papers that cite the same sources. Convergence across methods is a strong signal that a cluster represents a genuine research community.
 
 - **Raise the edge threshold in dense networks.** If the co-citation or bibliographic coupling network is too tangled to read, increase the **Min co-citations** or **Min shared references** slider. Start at 3–5 for a corpus of several hundred papers.
+
+- **Use ISC (not global citations) to size nodes in internal analyses.** The default node size metric `isc` reflects how central a paper is within *this* corpus rather than globally. This often surfaces structurally important papers that have modest global citation counts but are heavily cross-referenced inside the field you are mapping. Switch to `citation_count` if you want to visually emphasise globally prominent works.
+
+- **Export graph views as CSV for cluster-level analysis.** The **Export view as CSV** button on each graph produces a flat edge list with cluster labels attached to both endpoints. This lets you analyse inter-cluster connectivity or build custom visualisations in tools like Excel, Python, or R without additional joins.
 
 - **The cache speeds up repeated runs.** Paper metadata and references are cached to a single file (`cache/semantic_scholar_cache.json`). Re-running the same query with the same papers will be significantly faster on subsequent runs. The cache is written atomically — interrupted runs do not corrupt it.
 
