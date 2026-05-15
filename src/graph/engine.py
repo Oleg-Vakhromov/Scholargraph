@@ -121,21 +121,28 @@ class GraphEngine:
         citations_df: pd.DataFrame,
         pagerank_scores: Dict[str, float],
         top_k: int = 100,
+        strategy: str = "pagerank",
     ) -> List[str]:
         """
         Identify top-K expansion candidates: papers referenced by the corpus
-        but not yet in the corpus, ranked by PageRank score.
+        but not yet in the corpus, ranked by the chosen strategy.
 
         Implements README section 4.6 — Step 6.
 
         Args:
             papers_df:       Current corpus (has "paper_id" column)
-            citations_df:    Citation edges (has "target" column)
+            citations_df:    Citation edges (has "source", "target" columns)
             pagerank_scores: Dict from compute_pagerank()
             top_k:           Maximum candidates to return
+            strategy:        Ranking method — "pagerank" (default) sorts by structural
+                             importance in the full citation graph and caps at top_k;
+                             "citation_count" filters to candidates cited by at least
+                             max(3, 75th-percentile) in-corpus papers, then sorts by
+                             count descending (top_k not applied — threshold is the
+                             filter, matching the notebook approach).
 
         Returns:
-            List of paper IDs sorted by pagerank_score descending.
+            List of paper IDs sorted descending by the chosen strategy score.
             Never includes IDs already in papers_df.
             Returns [] if citations_df is empty or all refs are already in corpus.
         """
@@ -152,10 +159,21 @@ class GraphEngine:
         if not candidates:
             return []
 
-        sorted_candidates = sorted(
-            candidates,
-            key=lambda cid: pagerank_scores.get(cid, 0.0),
-            reverse=True,
-        )
-
-        return sorted_candidates[:top_k]
+        if strategy == "citation_count":
+            counts = (
+                citations_df[citations_df["target"].isin(candidates)]["target"]
+                .value_counts()
+            )
+            # Mirror notebook threshold: 75th percentile of observed counts, minimum 3.
+            # Candidates with zero in-corpus citations are excluded automatically
+            # (they don't appear in counts at all).
+            threshold = int(max(3, counts.quantile(0.75))) if not counts.empty else 3
+            qualifying = counts[counts >= threshold].index.tolist()
+            return sorted(qualifying, key=lambda cid: counts[cid], reverse=True)
+        else:
+            sorted_candidates = sorted(
+                candidates,
+                key=lambda cid: pagerank_scores.get(cid, 0.0),
+                reverse=True,
+            )
+            return sorted_candidates[:top_k]

@@ -53,6 +53,8 @@ class CorpusExpander:
         top_k_candidates: int = 100,
         relevance_threshold: float = 0.3,
         min_new_papers: int = 1,
+        expansion_strategy: str = "pagerank",
+        apply_relevance_filter: bool = True,
         allowed_domains: list[str] | None = None,
         on_iteration: Callable[[int, int, int, int], None] | None = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -64,13 +66,19 @@ class CorpusExpander:
         returns both DataFrames for convenience.
 
         Args:
-            corpus:               CorpusBuilder with seed papers_df + citations_df.
-            query:                Original search query (used for relevance scoring).
-            max_iterations:       Hard cap on expansion iterations.
-            top_k_candidates:     Candidates per iteration passed to GraphEngine.
-            relevance_threshold:  Minimum cosine similarity for a paper to be added.
-            min_new_papers:       Stop if fewer than this many papers added in an
-                                  iteration (convergence criterion).
+            corpus:                 CorpusBuilder with seed papers_df + citations_df.
+            query:                  Original search query (used for relevance scoring).
+            max_iterations:         Hard cap on expansion iterations.
+            top_k_candidates:       Candidates per iteration (pagerank strategy only).
+            relevance_threshold:    Minimum cosine similarity for a paper to be added.
+            min_new_papers:         Stop if fewer than this many papers added in an
+                                    iteration (convergence criterion).
+            expansion_strategy:     Candidate ranking method — "pagerank" (default)
+                                    ranks by structural importance in the citation graph;
+                                    "citation_count" filters by 75th-percentile threshold
+                                    and ranks by in-corpus citation frequency.
+            apply_relevance_filter: When False, skip cosine similarity filtering and
+                                    add all domain-passing candidates directly.
 
         Returns:
             (papers_df, citations_df) — final expanded DataFrames from corpus.
@@ -87,6 +95,7 @@ class CorpusExpander:
                 corpus.citations_df,
                 scores,
                 top_k=top_k_candidates,
+                strategy=expansion_strategy,
             )
 
             if not candidate_ids:
@@ -110,10 +119,13 @@ class CorpusExpander:
             if not candidate_dicts:
                 break
 
-            # 3. Relevance filter
-            relevant_dicts = self._filter.filter(
-                query, candidate_dicts, threshold=relevance_threshold
-            )
+            # 3. Relevance filter (optional)
+            if apply_relevance_filter:
+                relevant_dicts = self._filter.filter(
+                    query, candidate_dicts, threshold=relevance_threshold
+                )
+            else:
+                relevant_dicts = candidate_dicts
 
             if not relevant_dicts:
                 break

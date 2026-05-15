@@ -193,6 +193,26 @@ with st.sidebar:
     )
     selected_model = _MODEL_OPTIONS[selected_model_label]
 
+    _STRATEGY_OPTIONS = {
+        "PageRank (graph-based)": "pagerank",
+        "In-sample citation count": "citation_count",
+    }
+    selected_strategy_label = st.selectbox(
+        "Ranking strategy",
+        options=list(_STRATEGY_OPTIONS.keys()),
+        index=0,
+        help="PageRank ranks candidates by structural importance in the full citation graph. "
+             "In-sample citation count ranks by how many corpus papers directly cite each candidate.",
+    )
+    selected_strategy = _STRATEGY_OPTIONS[selected_strategy_label]
+
+    apply_relevance_filter = st.checkbox(
+        "Apply relevance filter",
+        value=True,
+        help="Filter expansion candidates by cosine similarity to the query. "
+             "Disable to add all structurally or citation-qualified candidates regardless of topical similarity.",
+    )
+
     run_button = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
 
     _SENTINEL_PAPERS = Path("data/sentinel/papers.json")
@@ -357,6 +377,8 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
                 max_iterations=int(max_iterations),
                 top_k_candidates=int(top_k_candidates),
                 relevance_threshold=float(relevance_threshold),
+                expansion_strategy=selected_strategy,
+                apply_relevance_filter=apply_relevance_filter,
                 allowed_domains=st.session_state.get("selected_domains") or None,
                 on_iteration=_report_iteration,
             )
