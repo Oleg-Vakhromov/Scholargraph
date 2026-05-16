@@ -1,29 +1,77 @@
 # Scholargraph — User Guide
 
-Scholargraph is a local app that takes a single keyword and maps out an academic field. Most tools like Google Scholar or Semantic Scholar hand you a ranked list and call it done. Scholargraph treats that as a starting point. It follows citation links outward, using PageRank and semantic similarity to surface papers that sit at the structural core of the literature but would never appear on page one of a keyword search.
+Scholargraph is a literature mapping tool for academic researchers. You supply a keyword query; the tool builds a structured corpus from Semantic Scholar, maps citation relationships, detects research clusters, and produces export-ready outputs for further analysis in Gephi, Zotero, or R/Python.
 
-The output isn't a list; it's a graph. Papers that cite each other heavily cluster together. Co-citation groups show which works share the same intellectual roots. Bibliographic coupling finds parallel research threads with no direct citation link between them at all. Influence metrics identify the papers that bridge sub-fields — not just the ones with the biggest citation counts. Everything exports in standard formats and caches locally, so iterative exploration is fast and the results don't depend on any proprietary platform to reproduce.
+The core design premise is that a keyword search retrieves papers ranked by platform relevance, not by their structural role in the literature. Scholargraph treats the keyword results as a starting point — a seed — and then follows citation links outward, using PageRank and semantic similarity to surface papers that sit at the structural core of the literature but would never appear on page one of a keyword search. The output is a citation graph with cluster labels, influence metrics, and temporal trends, not a ranked list.
 
 ---
 
-## Changelog
+## How the Search Works
 
-### April 2026 — Graph display and export improvements
+The pipeline runs in two phases: **seeding** and **expansion**. Understanding both phases helps you choose the right parameter settings for your research question.
 
-- **Graph backgrounds** — All three network visualisations (co-citation, bibliographic coupling, knowledge graph) now use a light-grey background for better readability in bright environments.
-- **Node size metric** — A new **Graph Display Settings** panel lets you choose which metric drives node size across all graphs: in-sample citations (`isc`, default), global citation count, ISC ratio, sample relevance, or betweenness centrality.
-- **Node size scaling** — Two buttons (**＋ Size** / **－ Size**) scale all nodes up or down proportionally without changing their relative sizes.
-- **Open graph in new tab** — Each graph now has an **Open in new tab ↗** button that opens a fully self-contained HTML version of the current graph in a separate browser tab.
-- **Export graph view as CSV** — Each graph has an **Export view as CSV** button that downloads the currently visible edges (after threshold filtering) with columns: `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`.
-- **Download influential papers** — A download button below the Influential Papers table exports it to CSV directly.
+### Phase 1 — Seeding
 
-### Earlier — Cache, DOI enrichment, embedding models, BibTeX export (Anton Moiseev)
+When you click **▶ Run Pipeline**, Scholargraph sends your query to the Semantic Scholar bulk search endpoint. This returns up to **Seed limit** papers ranked by Semantic Scholar's default relevance ordering. Those papers are enriched with metadata (abstract, authors, venue, DOI, fields of study) via a batch API call.
 
-- **Persistent disk cache** — Paper metadata and reference lists are cached to `cache/semantic_scholar_cache.json` with atomic writes and retry logic (safe on Windows and OneDrive). Repeated runs re-use cached data with no API calls.
-- **DOI enrichment** — DOI is extracted from the `externalIds` field in the Semantic Scholar batch response. If missing, a title-match fallback call resolves it. A normalised DOI token and full `https://doi.org/` URL are stored per paper and propagated through all corpus outputs.
-- **Clickable DOI links** — Title rows in the Papers and Influential Papers tables include a **DOI ↗** link column that opens the publisher page when a DOI is available.
-- **Embedding model selector** — The sidebar offers three sentence-transformer models for relevance filtering: Fast / ~90 MB (`all-MiniLM-L6-v2`, default), Balanced / ~420 MB (`all-mpnet-base-v2`), and Long-context multilingual / ~2.2 GB (`BAAI/bge-m3`). The selected model is downloaded once and cached locally.
-- **BibTeX export with Zotero cluster tags** — The Export section includes a `papers.bib` download. Each entry carries a `keywords` field in the form `cluster:<label>`, allowing Zotero users to recreate the corpus cluster structure as Zotero collections using the keyword filter.
+At this point the corpus is a flat keyword-search result — the same papers you would get from searching Semantic Scholar directly, minus the web interface.
+
+**What you control in this phase:**
+
+- **Query** — free-text keyword search. Supports quoted phrases (e.g., `"meme stocks"`), plain keywords, or a combination. The query is also used later as the reference embedding for relevance filtering during expansion.
+- **Seed limit** — how many papers to retrieve from the initial keyword search (10–2000, default: 200). A larger seed gives broader initial coverage but increases runtime. For exploratory runs, 50–100 is usually sufficient.
+- **Year from / Year to + Apply year filter** — restricts the keyword search results to a publication year window. The checkbox must be enabled for the year bounds to take effect. Year filtering applies only to the seed; expansion may pull in papers outside the range if they are structurally well-connected.
+
+After seeding, the app pauses at the **Domain Picker** before continuing.
+
+### Phase 1b — Domain and Journal Filtering
+
+Before expansion begins, you can narrow the corpus along two dimensions.
+
+**Domain filter** — Semantic Scholar tags papers with fields of study (e.g., Economics, Computer Science, Psychology). The domain picker lists all fields found in the seed papers. Uncheck any that are off-topic. Papers not matching any selected field are dropped. If no field-of-study data is available for the seed, this step is skipped automatically.
+
+**Journal quartile filter** — when SCImago data is available, a second filter lets you restrict the corpus to journals in selected SCImago quartiles (Q1, Q2, Q3, Q4). Papers with no SCImago quartile data are excluded when any quartile is selected. Use this if you want to restrict the corpus to peer-reviewed journals of a particular standing.
+
+**Max seed papers (after domain filter)** — caps the corpus size after domain filtering (10–2000, default: 200). If more papers survive the domain filter than this cap, the lowest-cited papers are dropped first. This controls corpus size before expansion begins.
+
+Clicking **Confirm domains & continue** triggers the rest of the pipeline.
+
+### Phase 2 — Expansion
+
+Expansion iteratively adds papers that are structurally important to the corpus but were not returned by the keyword search. Each iteration follows this sequence:
+
+1. Build a citation graph from all corpus papers and their references.
+2. Rank papers that are referenced by the corpus but not yet in it (candidates) using the selected strategy.
+3. Filter candidates that do not meet the minimum in-corpus citation threshold.
+4. Optionally filter candidates by cosine similarity to the original query (relevance filter).
+5. Fetch full metadata and references for papers that pass all filters.
+6. Add passing papers to the corpus; deduplicate.
+7. Repeat until the iteration cap is reached, no candidates remain, or no new papers were added.
+
+**What you control in this phase:**
+
+**Ranking strategy** — determines how candidates are scored and selected:
+
+- **PageRank (graph-based)** (default) — computes PageRank over the full citation neighbourhood, including papers not yet in the corpus. A high PageRank score means the paper is structurally central to this specific literature: many paths in the citation network pass through it, regardless of its global citation count. Candidates must exceed the 75th-percentile PageRank threshold to qualify.
+- **In-sample citation count** — ranks candidates by how many corpus papers already cite them. This is the classic bibliometric approach — papers most cited within your corpus are added first. Candidates must be cited by at least max(3, 75th-percentile ISC) corpus papers to qualify.
+
+Use PageRank when you want to surface papers that bridge sub-fields or are structurally important but may not be the most-cited in any single cluster. Use in-sample citation count when you want the expansion to closely track what your existing corpus is already citing.
+
+**Max iterations** — hard cap on expansion passes (1–20, default: 3). More iterations produce a larger, denser corpus. Three passes is a reasonable starting point for a corpus of 200 seed papers. The loop stops earlier if convergence is reached (no qualifying candidates, no new papers added).
+
+**Min. in-corpus citations** — minimum number of corpus papers that must already cite a candidate for it to qualify for expansion (1–20, default: 1). Raising this to 2–3 makes the expansion more conservative: only papers that multiple corpus papers independently reference will be added, reducing the risk of pulling in tangential work.
+
+**Apply relevance filter** — when enabled (default), each candidate's title and abstract are embedded using the selected sentence-transformer model and compared against the original query by cosine similarity. Candidates below the **Relevance threshold** are discarded. Disable this if you want purely structure-driven expansion — every candidate that meets the citation threshold is added regardless of topical similarity to the query. Useful when the query is narrow but the literature spans multiple terminologies.
+
+**Relevance threshold** — cosine similarity cutoff (0.0–1.0, default: 0.3). This controls how strictly candidates must match the query embedding. 0.3 is permissive and appropriate for broad queries. Raise to 0.5–0.7 if the corpus drifts into adjacent fields; lower toward 0.1–0.2 if expansion is too conservative and stalls.
+
+**Embedding model** — the sentence-transformer model used to embed paper text during relevance filtering:
+
+- **Fast (~90 MB)** — `all-MiniLM-L6-v2`. Default. Adequate for most English-language academic queries.
+- **Balanced / High quality (~420 MB)** — `all-mpnet-base-v2`. Higher semantic accuracy; noticeably slower to load on first use.
+- **Long-context multilingual (~2.2 GB)** — `BAAI/bge-m3`. Best for multilingual corpora or queries with long abstracts. Large download on first use.
+
+Models are downloaded and cached locally on first use. Switching models during a session loads the new model from cache without re-downloading.
 
 ---
 
@@ -32,8 +80,6 @@ The output isn't a list; it's a graph. Papers that cite each other heavily clust
 - Python 3.10 or higher
 - pip
 - Internet access (Semantic Scholar API + first-run model download)
-
-On first run, the sentence-transformers library downloads the embedding model selected in the sidebar. The default **Fast** model (`all-MiniLM-L6-v2`) is ~90 MB. Larger models are downloaded only if selected. Downloads are cached locally and not repeated on subsequent runs.
 
 ---
 
@@ -46,8 +92,6 @@ On first run, the sentence-transformers library downloads the embedding model se
 pip install -r requirements.txt
 ```
 
-That installs: requests, pandas, networkx, python-louvain, sentence-transformers, streamlit, pyvis, and scikit-learn.
-
 ---
 
 ## Running the App
@@ -56,7 +100,7 @@ That installs: requests, pandas, networkx, python-louvain, sentence-transformers
 python -m streamlit run app.py
 ```
 
-Streamlit opens the app at `http://localhost:8501` in your default browser. The page loads immediately; the pipeline only runs when you click **▶ Run Pipeline**.
+Streamlit opens the app at `http://localhost:8501`. The page loads immediately; the pipeline only runs when you click **▶ Run Pipeline**.
 
 ---
 
@@ -71,289 +115,142 @@ Results appear below once the full pipeline finishes. For a fast test run, set *
 
 ---
 
-## UI Walkthrough
-
-### Sidebar Parameters
-
-All pipeline settings live in the left sidebar.
-
-**Query**
-Free-text keyword search sent to the Semantic Scholar bulk search endpoint. Supports quoted phrases (e.g., `"meme stocks"`) and plain keywords. This is the only required field.
-
-**Seed limit**
-Maximum number of papers returned by the initial search (range: 10–2000, default: 200). Larger values give broader initial coverage but make the pipeline slower. Start with 50–100 for exploratory runs.
-
-**Year from / Year to**
-Publication year bounds applied to the initial search results. Only active when the **Apply year filter** checkbox is checked. Has no effect when the checkbox is off.
-
-**Apply year filter**
-When unchecked (default), year bounds are ignored entirely and all publication years are included. Check this to restrict the corpus to a specific time window.
-
-**Max seed papers (after domain filter)**
-Maximum number of papers to keep after the domain filter is applied (range: 10–2000, default: 200). Use this to cap the corpus size before expansion begins.
-
-**Max iterations**
-How many expansion passes to run after the initial seed (range: 1–20, default: 3). Each pass fetches new papers from outside the current corpus based on PageRank scores and relevance. More iterations = larger, denser corpus. Three is a reasonable starting point.
-
-**Top-K candidates**
-How many high-PageRank candidate papers are evaluated per expansion iteration (range: 10–500, default: 50). These are papers referenced by the corpus but not yet in it. A higher value casts a wider net each iteration.
-
-**Relevance threshold**
-Cosine similarity cutoff used to filter expansion candidates (range: 0.0–1.0, default: 0.3). Candidates whose title+abstract embedding scores below this threshold against the original query are discarded. Raise it (e.g., 0.5–0.7) if the expanded corpus feels off-topic; lower it if expansion is too conservative.
-
-**Embedding model**
-Controls which sentence-transformer model is used to embed paper titles and abstracts during relevance filtering. Three options are available:
-
-- **Fast (~90 MB)** — `all-MiniLM-L6-v2`. Default. Best for most queries. Fast to load; good quality for English academic text.
-- **Balanced / High quality (~420 MB)** — `all-mpnet-base-v2`. Higher semantic accuracy; noticeably slower to load on first use.
-- **Long-context multilingual (~2.2 GB)** — `BAAI/bge-m3`. Best for multilingual corpora or queries with long abstracts. Large download on first use.
-
-The selected model is downloaded and cached locally on first use. Switching models during a session loads a new cached instance without re-downloading.
-
-**▶ Run Pipeline**
-Starts Stage 1 (seeding). After seeding completes, a domain picker appears before the pipeline continues.
-
----
-
-### Domain Picker
-
-After seeding, the app pauses to show a **Select relevant domains** panel. This lists all fields of study found in the seed papers.
-
-- Deselect domains that are clearly off-topic for your query.
-- Papers not matching any selected domain are dropped from the corpus.
-- If no field-of-study data is available, the step is skipped automatically.
-
-Click **Confirm domains & continue** to run the remaining pipeline stages: reference fetching, expansion, and analysis.
-
----
-
-### Results Panels
-
-Results appear below the domain picker after the full pipeline completes. They are computed once and persist until you run the pipeline again.
+## Results Panels
 
 **Metrics row**
-Two numbers at the top: total papers in the corpus and total citation edges. A quick sanity check before diving into the details.
+Total papers in the corpus and total citation edges — a quick sanity check before diving into the details.
 
 **Papers table**
-A sortable table listing every paper in the corpus with title, year, journal, citation count, authors, and a **DOI** column (↗ link). Sorted by citation count descending by default — the most globally-cited papers appear first. Papers with a known DOI show a clickable link to the publisher page; papers with no DOI show an empty cell.
+All corpus papers with title, year, journal, citation count, authors, and DOI. Sorted by citation count descending by default.
 
 **Influential Papers**
-Papers ranked by in-sample citation metrics — how often they are cited by other papers *within this corpus*, not just globally. Columns:
+Papers ranked by in-corpus influence metrics:
 
 - **isc** — in-sample citation count: how many corpus papers cite this paper
-- **isc_ratio** — isc as a percentage of the paper's total Semantic Scholar citations (capped at 100 %). A high ratio means this paper is especially central to this specific literature
+- **isc_ratio** — isc as a percentage of total Semantic Scholar citations (capped at 100 %). A high ratio means this paper is especially central to this specific literature relative to its global prominence
 - **sample_relevance** — isc as a percentage of total corpus size: what fraction of the corpus cites this paper
-- **betweenness_centrality** — how often this paper lies on the shortest path between other papers in the citation graph. High betweenness means the paper bridges otherwise-disconnected research clusters
-- **DOI** — clickable link (↗) to the publisher page, when available
+- **betweenness_centrality** — how often this paper lies on the shortest path between other papers in the citation graph; high betweenness identifies papers that bridge otherwise-disconnected research clusters
+- **DOI** — clickable link to the publisher page when available
 
-A **⬇ Download influential papers** button below the table exports the current view to CSV.
+A **⬇ Download influential papers** button exports the current view to CSV.
 
 **Graph Display Settings**
-A shared control panel that applies to all three network graphs below it.
+Shared controls for all three network graphs below:
 
-- **Node size metric** — selects which value drives node size across all graphs. Options: `isc` (default), `citation_count`, `isc_ratio`, `sample_relevance`, `betweenness_centrality`. Changing the metric rerenders all graphs on the next interaction.
-- **＋ Size / － Size** — scale all nodes up or down by a fixed factor while preserving their relative sizes. Each click multiplies or divides the global scale by 1.3.
+- **Node size metric** — selects which value drives node size: `isc` (default), `citation_count`, `isc_ratio`, `sample_relevance`, or `betweenness_centrality`
+- **＋ Size / － Size** — scale all nodes up or down proportionally
 
 **Co-citation Analysis**
-Papers that are frequently cited together by the same sources are likely intellectually related, even if they do not cite each other directly. This panel shows a network where:
-
-- Nodes are corpus papers that appear in at least one co-citation pair
-- Edges connect paper pairs cited together, with edge thickness proportional to co-citation count
-- Node colour reflects cluster membership from AgglomerativeClustering applied to the co-citation similarity matrix
-- Node size reflects the metric selected in **Graph Display Settings**
-
-Two controls adjust the view:
-- **Co-citation clusters** — number of clusters to detect (default: matches the Louvain cluster count, capped at 20)
-- **Min co-citations (edge threshold)** — minimum times two papers must be co-cited for an edge to appear (default: 2). Raise this to declutter dense networks
-
-Below the graph, two buttons are available:
-- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
-- **⬇ Export view as CSV** — downloads the currently visible edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
+Papers that are frequently cited together by the same sources cluster together here, even without a direct citation link between them. Controls: number of clusters, minimum co-citation count for an edge to appear.
 
 **Bibliographic Coupling**
-Papers that cite the same sources share intellectual foundations and are likely working in the same research area. This panel shows a network where:
-
-- Nodes are corpus papers that share at least one reference with another corpus paper
-- Edges connect paper pairs with shared references, with edge thickness proportional to the number of shared references
-- Node colour reflects cluster membership from AgglomerativeClustering applied to the coupling strength matrix
-- Node size reflects the metric selected in **Graph Display Settings**
-
-Two controls adjust the view:
-- **Coupling clusters** — number of clusters to detect
-- **Min shared references (edge threshold)** — minimum shared references required for an edge to appear (default: 2)
-
-Below the graph, two buttons are available:
-- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
-- **⬇ Export view as CSV** — downloads the currently visible edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
+Papers that cite the same sources share intellectual foundations. This network connects papers by shared references. Controls: number of clusters, minimum shared references for an edge to appear.
 
 **Clusters**
-Research clusters detected automatically via Louvain community detection on the citation graph. Displays a summary table with:
-- Cluster ID
-- Keyword label (top 5 most common non-stopword title words across papers in the cluster)
-- Paper count
-- Most-cited paper in the cluster
-
-Clusters represent topical sub-communities within the corpus. A cluster with many papers and high citation counts for its top paper is likely a core research stream.
+Research clusters detected via Louvain community detection on the citation graph. Each cluster is labeled by its most frequent non-stopword title words. A single partition is computed for the entire corpus and reused consistently across the cluster summary, graph colouring, and temporal chart — re-running community detection per year would produce inconsistent cluster IDs.
 
 **Knowledge Graph**
-An interactive node-link diagram of the corpus. Each node is a paper; edges are citation links (A → B means A cites B). Node size reflects the metric selected in **Graph Display Settings**; node colour reflects Louvain cluster. Use the **Max nodes** slider above the graph to control how many papers are shown (top N by citation count). Pan and zoom with the mouse.
+Interactive citation network of the corpus. Nodes are papers; edges are citation links. The **Max nodes** slider limits the display to the top N papers by citation count.
 
-Below the graph, two buttons are available:
-- **Open in new tab ↗** — opens a self-contained HTML version of the current graph in a new browser tab
-- **⬇ Export view as CSV** — downloads the currently visible citation edges as a CSV file with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
+Each of the three network graphs has two buttons:
+- **Open in new tab ↗** — opens a self-contained HTML version in a new browser tab
+- **⬇ Export view as CSV** — downloads the currently visible edges with columns `cluster_from`, `from_paper_name`, `cluster_to`, `to_paper_name`
 
 **Temporal Evolution**
-A line chart showing how many papers per cluster were published in each year. Each line is a cluster, labeled by its keyword label. Use this to spot which research streams are growing, stable, or declining — and when new streams emerged.
+A line chart showing papers per cluster published each year, using the single corpus-wide Louvain partition. Use this to identify which research streams are growing, stable, or declining, and when new streams emerged.
 
 **Export**
-Four download buttons for taking the corpus elsewhere:
+Four download formats:
 - **papers.csv** — full corpus metadata (one row per paper)
 - **citations.csv** — citation edge list (source → target)
-- **graph.graphml** — the citation graph in GraphML format, compatible with Gephi, Cytoscape, and NetworkX
-- **papers.bib** — BibTeX export of the full corpus. Each entry includes title, authors, year, journal, DOI, and a `keywords` field containing `cluster:<label>` (e.g., `cluster:machine learning`). Import into Zotero to recreate corpus clusters as Zotero collections using the keyword filter.
+- **graph.graphml** — citation graph compatible with Gephi, Cytoscape, and NetworkX
+- **papers.bib** — BibTeX export. Each entry carries a `keywords` field in the form `cluster:<label>` (e.g., `cluster:behavioral finance`). Import into Zotero and filter by keyword to recreate the cluster structure as Zotero collections.
 
 ---
 
 ## Tips
 
-- **Start small.** Set Seed limit to 50 and Max iterations to 1 for a quick test run before committing to a full pipeline execution. A full run with limit=200 and 3 iterations can take several minutes.
+**Start with a small run.** Set Seed limit to 50 and Max iterations to 1 before committing to a full run. A full pipeline with 200 seed papers and 3 iterations can take several minutes — most of that time is rate-limited API calls, not computation.
 
-- **Use the domain picker to focus the corpus.** Dropping off-topic fields before expansion prevents irrelevant papers from proliferating into the corpus via PageRank. For a query like `retail investor sentiment`, you would typically deselect domains like Computer Science or Mathematics if they appear.
+**Use the domain picker to focus the corpus before expansion.** Dropping off-topic fields at the domain filtering step prevents irrelevant papers from proliferating through PageRank during expansion. For a query like `retail investor sentiment`, deselect Computer Science or Mathematics if they appear.
 
-- **Tune the relevance threshold if results feel off-topic.** The default (0.3) is permissive. Raise it to 0.5 or 0.6 if the expanded corpus is drifting away from your query.
+**Prefer PageRank for interdisciplinary topics.** PageRank surfaces papers that bridge sub-fields — papers that a pure citation-count approach would underrank because their influence is distributed across multiple clusters rather than concentrated in one.
 
-- **Compare co-citation and bibliographic coupling clusters to Louvain clusters.** The three clustering methods capture different notions of proximity. Louvain uses direct citation links; co-citation groups papers cited together; bibliographic coupling groups papers that cite the same sources. Convergence across methods is a strong signal that a cluster represents a genuine research community.
+**Use in-sample citation count for well-defined fields.** When the literature has a clear canon, in-sample citation count expansion stays closer to what researchers in that field already recognise as foundational.
 
-- **Raise the edge threshold in dense networks.** If the co-citation or bibliographic coupling network is too tangled to read, increase the **Min co-citations** or **Min shared references** slider. Start at 3–5 for a corpus of several hundred papers.
+**Raise Min. in-corpus citations to 2–3 for conservative expansion.** The default of 1 means any paper cited by even one corpus paper is a candidate. Raising this threshold ensures candidates have multiple independent endorsers in the corpus before being added.
 
-- **Use ISC (not global citations) to size nodes in internal analyses.** The default node size metric `isc` reflects how central a paper is within *this* corpus rather than globally. This often surfaces structurally important papers that have modest global citation counts but are heavily cross-referenced inside the field you are mapping. Switch to `citation_count` if you want to visually emphasise globally prominent works.
+**Tune the relevance threshold if expansion drifts.** If the corpus picks up papers from adjacent fields, raise the threshold to 0.5–0.6. If expansion stalls and the corpus is smaller than expected, lower it to 0.15–0.2.
 
-- **Export graph views as CSV for cluster-level analysis.** The **Export view as CSV** button on each graph produces a flat edge list with cluster labels attached to both endpoints. This lets you analyse inter-cluster connectivity or build custom visualisations in tools like Excel, Python, or R without additional joins.
+**Disable the relevance filter for terminologically diverse literatures.** A multi-disciplinary topic may use very different vocabulary across sub-fields. Cosine similarity against a single query string will penalise papers that are structurally central but use different terminology. Disabling the filter lets structure alone drive expansion.
 
-- **The cache speeds up repeated runs.** Paper metadata and references are cached to a single file (`cache/semantic_scholar_cache.json`). Re-running the same query with the same papers will be significantly faster on subsequent runs. The cache is written atomically — interrupted runs do not corrupt it.
+**Use ISC to size nodes in internal analyses.** The default node size metric `isc` reflects centrality within this corpus. Switch to `citation_count` to emphasise globally prominent works.
 
-- **Use GraphML for deeper analysis.** The exported `graph.graphml` file can be opened in Gephi for advanced layout algorithms, filtering, and centrality calculations not available in the built-in graph view.
+**Compare co-citation, bibliographic coupling, and Louvain clusters.** The three methods capture different proximity signals. Convergence across methods — a cluster that appears in all three — is a strong signal of a genuine, coherent research community.
 
-- **Use BibTeX export with Zotero to recreate clusters.** Download `papers.bib` and import it into Zotero. Each entry carries a `keywords` field with its cluster label (e.g., `cluster:behavioral finance`). Use Zotero's search to filter by keyword and create a collection per cluster — you get the Scholargraph cluster structure inside your reference manager.
+**Raise the edge threshold in dense networks.** For a corpus of several hundred papers, set Min co-citations or Min shared references to 3–5 to reduce visual clutter.
 
-- **Year filter applies to the seed only.** The expansion phase may pull in papers outside the year range if they are highly connected to the corpus. If strict year bounds matter, post-filter `papers.csv` after export.
+**The cache speeds up repeated runs.** Paper metadata and references are cached to `cache/semantic_scholar_cache.json`. Re-running the same query is significantly faster after the first run. The search results themselves are always fetched fresh.
+
+**Year filter applies to the seed only.** Expansion may pull in papers outside the year range if they are structurally well-connected. For strict year bounds, filter `papers.csv` after export.
 
 ---
 
-## Pipeline Logic
+## Changelog
 
-This section explains what the tool does at each stage of the pipeline.
+### April 2026 — Graph display and export improvements
 
-### Stage 1: Seeding the Corpus
+- **Graph backgrounds** — All three network visualisations now use a light-grey background for better readability.
+- **Node size metric** — A new **Graph Display Settings** panel lets you choose which metric drives node size across all graphs: `isc` (default), `citation_count`, `isc_ratio`, `sample_relevance`, or `betweenness_centrality`.
+- **Node size scaling** — **＋ Size / － Size** buttons scale all nodes proportionally.
+- **Open graph in new tab** — Each graph has an **Open in new tab ↗** button that opens a self-contained HTML version.
+- **Export graph view as CSV** — Each graph has an **⬇ Export view as CSV** button.
+- **Download influential papers** — A download button below the Influential Papers table exports it to CSV.
 
-When you click **▶ Run Pipeline**, the tool sends your query to the Semantic Scholar bulk search endpoint (`GET /paper/search/bulk`). This returns up to **Seed limit** papers ranked by Semantic Scholar's default relevance ordering, with basic metadata: paper ID, title, year, and citation count. Results are paginated using a cursor token and fetched until the limit is reached.
+### Earlier — Cache, DOI enrichment, embedding models, BibTeX export (Anton Moiseev)
 
-The returned paper IDs are then sent to the batch metadata endpoint (`POST /paper/batch`) in chunks of up to 500 IDs at a time. This enriches each paper with its abstract, authors, venue, reference count, and fields of study.
+- **Persistent disk cache** — Paper metadata and reference lists cached to `cache/semantic_scholar_cache.json` with atomic writes and retry logic.
+- **DOI enrichment** — DOI extracted from the Semantic Scholar batch response; title-match fallback if missing.
+- **Clickable DOI links** — Papers and Influential Papers tables include a **DOI ↗** link column.
+- **Embedding model selector** — Three sentence-transformer models for relevance filtering.
+- **BibTeX export with Zotero cluster tags** — Each BibTeX entry carries a `keywords` field with its cluster label.
 
-For papers where the batch endpoint returns no journal name, the pipeline makes an additional call to the title-match endpoint (`GET /paper/search/match`) using the paper's title. The journal name returned by that lookup is used to fill the gap. This fallback runs once per paper with a missing journal, so the number of extra API calls depends on how many papers lack venue data in the batch response.
+---
 
-The batch response also returns the paper's DOI via its external identifier list. A normalized DOI token (`doi`) and a full URL (`doi_url = https://doi.org/{doi}`) are extracted for each paper. If the DOI is missing from the batch response, the title-match fallback call is used to resolve it as well — a single fallback call covers both missing journal and missing DOI.
+## Pipeline Architecture
 
-If **Apply year filter** is checked, papers outside the specified year range are dropped at this point.
+### Stage 1 — Seeding
 
-**Output:** `papers_df` — one row per paper. Key columns: `paper_id`, `title`, `year`, `citation_count`, `abstract`, `authors`, `venue`, `reference_count`, `fields_of_study`.
+Sends the query to `GET /paper/search/bulk`. Enriches returned paper IDs via `POST /paper/batch` (chunks of 500). Falls back to `GET /paper/search/match` by title for missing journal names or DOIs. Applies year filter if enabled.
 
-### Stage 1b: Domain Filtering
+### Stage 1b — Domain and Journal Filtering
 
-After seeding, the app extracts the unique fields of study from all seed papers and presents them in the domain picker. When you confirm a selection:
+Extracts fields of study from seed papers; presents domain picker. Applies domain filter, journal quartile filter (if SCImago data is loaded), and the max-seed-papers cap. No API calls.
 
-1. Papers not matching any selected domain are removed from `papers_df`.
-2. The corpus is further capped at **Max seed papers** by dropping lowest-cited papers beyond the cap.
+### Stage 2 — Reference Fetching
 
-This step has no API calls — it operates entirely on the data already fetched in Stage 1.
+Calls `GET /paper/{id}/references` for each corpus paper (one call per paper, minimum 1-second gap between calls). Builds `citations_df` — the directed citation edge list.
 
-**Output:** `papers_df` trimmed to domain-matching, capped corpus.
+### Stage 3 — Expansion
 
-### Stage 2: Fetching References
+Iterative loop: build graph → compute scores (PageRank or in-sample citation count) → filter candidates → fetch metadata → relevance filter → fetch references → append. Stops at max iterations, convergence, or no passing candidates.
 
-For each paper in the corpus, the pipeline calls `GET /paper/{paperId}/references` to retrieve the list of papers it cites. Each reference record becomes a directed citation edge: **source** (the corpus paper) → **target** (the paper it cites).
+### Stage 4 — Cluster Analysis
 
-These target papers may or may not be in the corpus. Papers referenced by the corpus but not yet in it are the raw material for the expansion stage.
+Louvain community detection on the undirected citation graph. Labels clusters from top non-stopword title words. One partition, reused for all downstream steps.
 
-**Output:** `citations_df` — one row per citation edge. Columns: `source`, `target`, `title` (of target), `year` (of target).
+### Stage 5 — Influence Analysis
 
-**Note on speed:** Reference fetching makes one API call per corpus paper, with a minimum 1-second gap between calls (unauthenticated API tier). A seed corpus of 200 papers will take roughly 3–4 minutes for this stage alone on first run. Subsequent runs are faster because fetched references are cached to disk.
+Computes isc, isc_ratio, sample_relevance, and betweenness_centrality from the final corpus.
 
-### Stage 3: Expansion Engine
+### Stage 6 — Co-citation and Bibliographic Coupling
 
-After seeding and reference fetching, the pipeline runs up to **Max iterations** expansion passes. Each pass follows the same sequence:
+Co-citation: pairs of corpus papers cited together accumulate strength. Bibliographic coupling: pairs of corpus papers sharing references accumulate strength. Both matrices are converted to distance matrices and clustered with AgglomerativeClustering (average linkage).
 
-**1. Build the citation graph**
+### Stage 7 — Temporal Analysis
 
-A directed graph is constructed: nodes are papers in the corpus, edges are citation links from `citations_df`. Papers referenced by the corpus but not yet in it are also added as nodes. This allows PageRank to propagate across the full citation neighbourhood.
-
-**2. Compute PageRank**
-
-PageRank (damping factor α = 0.85) is computed over the full graph. A high PageRank score means a paper is structurally central to this literature — not just globally popular, but important within the specific citation neighbourhood of your corpus.
-
-**3. Select expansion candidates**
-
-All papers referenced by the corpus but not yet in it are candidates. They are ranked by PageRank and the top **Top-K candidates** are selected.
-
-**4. Filter by domain**
-
-If domains were selected in the domain picker, candidates whose fields of study do not intersect the selected domains are discarded before the relevance filter.
-
-**5. Filter by relevance**
-
-Each candidate's title and abstract are embedded using `all-MiniLM-L6-v2`. Cosine similarity is computed against the original query embedding. Candidates scoring below the **Relevance threshold** are discarded.
-
-**6. Fetch references for new papers**
-
-For each paper that passes both filters, its references are fetched from the API. New citation edges are added to `citations_df`.
-
-**7. Append and deduplicate**
-
-Passing papers are appended to `papers_df`. Duplicate paper IDs and citation edges are removed.
-
-**Convergence:** The loop stops early when Max iterations is reached, no candidates remain, no candidates pass the filters, or fewer than 1 new paper was added in the last iteration.
-
-### Stage 4: Cluster Analysis
-
-After expansion, Louvain community detection groups papers into research clusters.
-
-The citation graph is converted to undirected before Louvain runs — direction is less useful for finding topical communities than the raw co-citation and coupling signal captured by the undirected edges.
-
-**Cluster labels** are generated from the most frequent non-stopword title words across all papers in each cluster.
-
-**One partition is computed for the entire corpus and reused for all downstream steps** — graph coloring, the cluster summary table, and the temporal chart. Re-running Louvain per year would produce inconsistent cluster IDs, making year-over-year comparison impossible.
-
-**Output:** `cluster_id` column added to `papers_df`; cluster summary table.
-
-### Stage 5: Influence Analysis
-
-Three metrics are computed per paper from the final corpus:
-
-- **isc** — count of corpus papers that cite this paper (in-corpus citation count)
-- **isc_ratio** — isc / total Semantic Scholar citations × 100, capped at 100 %
-- **sample_relevance** — isc / corpus size × 100
-- **betweenness_centrality** — normalised betweenness on the undirected citation graph
-
-These are computed once on first render and cached in session state.
-
-### Stage 6: Co-citation and Bibliographic Coupling
-
-Two complementary proximity analyses are computed from `citations_df`:
-
-**Co-citation:** For each paper that cites two or more corpus papers, those corpus papers accumulate one unit of co-citation strength. The result is a symmetric pair-count matrix across all corpus papers.
-
-**Bibliographic coupling:** For each corpus paper that is cited by two or more corpus papers, those citing corpus papers accumulate one unit of coupling strength. Equivalently: two corpus papers are coupled by every shared reference they both cite.
-
-Both matrices are converted to distance matrices (`d = 1 / (1 + strength)`) and clustered using AgglomerativeClustering with average linkage. Papers with no co-citation or coupling relationships receive cluster ID −1 and are shown in grey.
-
-Both matrices are computed once and cached; cluster assignments are recalculated on each render when the cluster count control is changed.
-
-### Stage 7: Temporal Analysis
-
-For each combination of publication year and cluster ID in `papers_df`, the pipeline counts how many papers belong to that cluster and were published in that year. The result is a year × cluster matrix used as the line chart. Papers with no recorded publication year are excluded.
+Counts papers per cluster per year. Papers with no recorded publication year are excluded.
 
 ### Cache and Rate Limiting
 
-The pipeline enforces a minimum 1-second gap between API requests to stay within the Semantic Scholar unauthenticated rate limit (~1 req/sec). If the API returns HTTP 429 (rate limit exceeded), the client retries with exponential backoff: up to 4 attempts at 60 s, 120 s, and 240 s intervals.
-
-Paper metadata and reference lists are cached to a single file (`cache/semantic_scholar_cache.json`) after each API call. Writes are atomic (temp file + rename) so an interrupted run cannot corrupt the cache. On subsequent runs, cached papers and references are served from disk with no API request. The search query itself is never cached — search results are always fetched fresh. Journal names resolved via the title-match fallback are stored in the paper's cache entry, so the fallback call is not repeated on re-runs.
+1-second minimum gap between API calls. HTTP 429 triggers exponential backoff (up to 4 retries at 60 s, 120 s, 240 s). Cache writes are atomic (temp file + rename).

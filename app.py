@@ -923,7 +923,7 @@ if st.session_state["papers_df"] is not None:
     if not evolution.empty:
         pivot = TemporalAnalyzer().evolution_pivot(evolution)
         pivot.columns = [
-            f"#{int(c)}: {_labels.get(int(c), f'cluster-{int(c)}')}"
+            f"#{int(c)} {_labels.get(int(c), f'cluster-{int(c)}')}"
             for c in pivot.columns
         ]
         st.line_chart(pivot)
