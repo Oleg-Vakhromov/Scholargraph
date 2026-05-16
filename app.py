@@ -89,8 +89,13 @@ def _load_filter(model_name: str = "all-MiniLM-L6-v2"):
 def _get_client():
     from src.api.semantic_scholar import SemanticScholarClient
     from src.cache.cache_manager import DiskCache
-    cache = DiskCache(cache_dir="cache")
-    cache.load()
+    import os
+    _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    try:
+        cache = DiskCache(cache_dir=_cache_dir)
+        cache.load()
+    except Exception:
+        cache = None
     return SemanticScholarClient(cache=cache)
 
 
