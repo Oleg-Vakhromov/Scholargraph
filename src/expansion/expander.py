@@ -50,11 +50,11 @@ class CorpusExpander:
         corpus: CorpusBuilder,
         query: str,
         max_iterations: int = 5,
-        top_k_candidates: int = 100,
         relevance_threshold: float = 0.3,
         min_new_papers: int = 1,
         expansion_strategy: str = "pagerank",
         apply_relevance_filter: bool = True,
+        min_citations: int = 1,
         allowed_domains: list[str] | None = None,
         on_iteration: Callable[[int, int, int, int], None] | None = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -69,16 +69,16 @@ class CorpusExpander:
             corpus:                 CorpusBuilder with seed papers_df + citations_df.
             query:                  Original search query (used for relevance scoring).
             max_iterations:         Hard cap on expansion iterations.
-            top_k_candidates:       Candidates per iteration (pagerank strategy only).
             relevance_threshold:    Minimum cosine similarity for a paper to be added.
             min_new_papers:         Stop if fewer than this many papers added in an
                                     iteration (convergence criterion).
-            expansion_strategy:     Candidate ranking method — "pagerank" (default)
-                                    ranks by structural importance in the citation graph;
-                                    "citation_count" filters by 75th-percentile threshold
-                                    and ranks by in-corpus citation frequency.
+            expansion_strategy:     Candidate ranking method — "pagerank" (default) or
+                                    "citation_count". Both filter by min_citations and
+                                    a 75th-percentile threshold.
             apply_relevance_filter: When False, skip cosine similarity filtering and
-                                    add all domain-passing candidates directly.
+                                    add all threshold-passing candidates directly.
+            min_citations:          Minimum in-corpus citations a candidate must have
+                                    to qualify (default 1).
 
         Returns:
             (papers_df, citations_df) — final expanded DataFrames from corpus.
@@ -94,8 +94,8 @@ class CorpusExpander:
                 corpus.papers_df,
                 corpus.citations_df,
                 scores,
-                top_k=top_k_candidates,
                 strategy=expansion_strategy,
+                min_citations=min_citations,
             )
 
             if not candidate_ids:

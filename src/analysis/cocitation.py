@@ -21,7 +21,7 @@ class CoCitationAnalyzer:
     Usage:
         ca = CoCitationAnalyzer()
         coc_df = ca.build_cocitation_matrix(corpus.citations_df, set(papers_df["paper_id"]))
-        clusters = ca.cluster_papers(coc_df, list(papers_df["paper_id"]), n_clusters=5)
+        clusters = ca.cluster_papers(coc_df, list(papers_df["paper_id"]), resolution=0.5)
     """
 
     # ------------------------------------------------------------------
@@ -86,7 +86,7 @@ class CoCitationAnalyzer:
         self,
         cocitation_df: pd.DataFrame,
         paper_ids: Iterable[str],
-        n_clusters: int = 5,
+        resolution: float = 0.5,
     ) -> Dict[str, int]:
         """
         Cluster papers using AgglomerativeClustering on the co-citation matrix.
@@ -97,17 +97,18 @@ class CoCitationAnalyzer:
         Args:
             cocitation_df: Output of build_cocitation_matrix().
             paper_ids:     All corpus paper IDs to include in result.
-            n_clusters:    Number of clusters (must be >= 2).
+            resolution:    Clustering granularity (0.1–1.0). Higher values produce
+                           more, smaller clusters. Converted to a dendrogram distance
+                           threshold: distance_threshold = 1.0 - resolution.
 
         Returns:
             Dict mapping paper_id -> int cluster_id.
-            Papers in the co-citation matrix: cluster_id in [0, n_clusters).
             Papers outside the matrix: cluster_id = -1.
         """
         all_ids = list(paper_ids)
         fallback = {pid: 0 for pid in all_ids}
 
-        if cocitation_df.empty or n_clusters < 2:
+        if cocitation_df.empty:
             return fallback
 
         # Collect papers that appear in the co-citation matrix
@@ -115,10 +116,6 @@ class CoCitationAnalyzer:
             set(cocitation_df["paper_a"]) | set(cocitation_df["paper_b"])
         )
         n = len(matrix_ids)
-
-        if n < n_clusters:
-            # Fewer matrix papers than requested clusters — clamp
-            n_clusters = max(2, n)
 
         if n < 2:
             return fallback
@@ -142,7 +139,9 @@ class CoCitationAnalyzer:
         from sklearn.cluster import AgglomerativeClustering
 
         model = AgglomerativeClustering(
-            n_clusters=n_clusters,
+            n_clusters=None,
+            distance_threshold=1.0 - resolution,
+            compute_full_tree=True,
             metric="precomputed",
             linkage="average",
         )

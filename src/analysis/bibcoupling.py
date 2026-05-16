@@ -20,7 +20,7 @@ class BibliographicCoupler:
     Usage:
         bc = BibliographicCoupler()
         coup_df = bc.build_coupling_matrix(corpus.citations_df, set(papers_df["paper_id"]))
-        clusters = bc.cluster_papers(coup_df, list(papers_df["paper_id"]), n_clusters=5)
+        clusters = bc.cluster_papers(coup_df, list(papers_df["paper_id"]), resolution=0.5)
     """
 
     # ------------------------------------------------------------------
@@ -86,7 +86,7 @@ class BibliographicCoupler:
         self,
         coupling_df: pd.DataFrame,
         paper_ids: Iterable[str],
-        n_clusters: int = 5,
+        resolution: float = 0.5,
     ) -> Dict[str, int]:
         """
         Cluster papers using AgglomerativeClustering on the coupling matrix.
@@ -97,17 +97,18 @@ class BibliographicCoupler:
         Args:
             coupling_df: Output of build_coupling_matrix().
             paper_ids:   All corpus paper IDs to include in result.
-            n_clusters:  Number of clusters (must be >= 2).
+            resolution:  Clustering granularity (0.1–1.0). Higher values produce
+                         more, smaller clusters. Converted to a dendrogram distance
+                         threshold: distance_threshold = 1.0 - resolution.
 
         Returns:
             Dict mapping paper_id -> int cluster_id.
-            Papers in the coupling matrix: cluster_id in [0, n_clusters).
             Papers outside the matrix: cluster_id = -1.
         """
         all_ids = list(paper_ids)
         fallback = {pid: 0 for pid in all_ids}
 
-        if coupling_df.empty or n_clusters < 2:
+        if coupling_df.empty:
             return fallback
 
         # Collect papers that appear in the coupling matrix
@@ -115,9 +116,6 @@ class BibliographicCoupler:
             set(coupling_df["paper_a"]) | set(coupling_df["paper_b"])
         )
         n = len(matrix_ids)
-
-        if n < n_clusters:
-            n_clusters = max(2, n)
 
         if n < 2:
             return fallback
@@ -139,7 +137,9 @@ class BibliographicCoupler:
         from sklearn.cluster import AgglomerativeClustering
 
         model = AgglomerativeClustering(
-            n_clusters=n_clusters,
+            n_clusters=None,
+            distance_threshold=1.0 - resolution,
+            compute_full_tree=True,
             metric="precomputed",
             linkage="average",
         )

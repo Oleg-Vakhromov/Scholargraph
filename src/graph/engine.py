@@ -16,9 +16,30 @@ class GraphEngine:
         scores = engine.compute_pagerank(G)
         corpus.papers_df = engine.add_pagerank_scores(corpus.papers_df, scores)
         candidates = engine.get_expansion_candidates(
-            corpus.papers_df, corpus.citations_df, scores, top_k=100
+            corpus.papers_df, corpus.citations_df, scores
         )
     """
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _canonical_map(self, papers_df: pd.DataFrame) -> Dict[str, str]:
+        """
+        Build a paper_id → canonical_id map for graph node identity.
+
+        Canonical ID is the DOI when available (since one DOI may have multiple
+        Semantic Scholar paper IDs), otherwise the paper_id itself.
+        """
+        if "doi" not in papers_df.columns:
+            return dict(zip(papers_df["paper_id"], papers_df["paper_id"]))
+        result = {}
+        for pid, doi in zip(papers_df["paper_id"], papers_df["doi"]):
+            if doi and isinstance(doi, str) and doi.strip():
+                result[pid] = doi.strip()
+            else:
+                result[pid] = pid
+        return result
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -28,8 +49,10 @@ class GraphEngine:
         """
         Build a directed citation graph from corpus data.
 
-        Nodes: all paper_ids in papers_df (corpus members)
-        Edges: source→target pairs from citations_df (deduplicated)
+        Nodes: canonical IDs for corpus papers (DOI when available, else paper_id).
+               Papers sharing a DOI are merged into a single node.
+        Edges: source→target pairs from citations_df, translated to canonical IDs
+               for corpus members; out-of-corpus IDs are kept as-is.
 
         Out-of-corpus targets are added as nodes automatically by NetworkX
         when edges are added — this is intentional for PageRank computation
@@ -44,13 +67,17 @@ class GraphEngine:
         """
         G = nx.DiGraph()
 
-        # Add all corpus papers as nodes
-        G.add_nodes_from(papers_df["paper_id"])
+        canon = self._canonical_map(papers_df)
 
-        # Add citation edges (deduplicated)
+        # Add corpus nodes using canonical IDs (deduplicates papers sharing a DOI)
+        G.add_nodes_from(set(canon.values()))
+
+        # Add citation edges translated to canonical IDs and deduplicated
         if not citations_df.empty:
+            src = citations_df["source"].apply(lambda x: canon.get(x, x))
+            tgt = citations_df["target"].apply(lambda x: canon.get(x, x))
             edges = (
-                citations_df[["source", "target"]]
+                pd.DataFrame({"source": src, "target": tgt})
                 .drop_duplicates()
                 .itertuples(index=False, name=None)
             )
@@ -107,7 +134,9 @@ class GraphEngine:
             New DataFrame with "pagerank_score" column (float64), sorted descending.
         """
         df = papers_df.copy()
-        df["pagerank_score"] = df["paper_id"].map(pagerank_scores).fillna(0.0)
+        canon = self._canonical_map(papers_df)
+        score_map = {pid: pagerank_scores.get(cid, 0.0) for pid, cid in canon.items()}
+        df["pagerank_score"] = df["paper_id"].map(score_map).fillna(0.0)
         df = df.sort_values("pagerank_score", ascending=False).reset_index(drop=True)
         return df
 
@@ -120,60 +149,69 @@ class GraphEngine:
         papers_df: pd.DataFrame,
         citations_df: pd.DataFrame,
         pagerank_scores: Dict[str, float],
-        top_k: int = 100,
         strategy: str = "pagerank",
+        min_citations: int = 1,
     ) -> List[str]:
         """
-        Identify top-K expansion candidates: papers referenced by the corpus
-        but not yet in the corpus, ranked by the chosen strategy.
+        Identify expansion candidates: papers referenced by the corpus but not yet
+        in the corpus, filtered by a minimum citation count and a 75th-percentile
+        threshold, then sorted descending.
 
-        Implements README section 4.6 — Step 6.
+        Both strategies require each candidate to appear as a citation target at least
+        `min_citations` times in the corpus before any further filtering:
+
+        - "pagerank": among candidates meeting min_citations, keep those at or above
+          the 75th percentile of their PageRank scores, sorted by score.
+        - "citation_count": threshold = max(min_citations, 75th percentile of
+          in-corpus citation counts), sorted by count.
 
         Args:
-            papers_df:       Current corpus (has "paper_id" column)
-            citations_df:    Citation edges (has "source", "target" columns)
+            papers_df:     Current corpus (has "paper_id" column)
+            citations_df:  Citation edges (has "source", "target" columns)
             pagerank_scores: Dict from compute_pagerank()
-            top_k:           Maximum candidates to return
-            strategy:        Ranking method — "pagerank" (default) sorts by structural
-                             importance in the full citation graph and caps at top_k;
-                             "citation_count" filters to candidates cited by at least
-                             max(3, 75th-percentile) in-corpus papers, then sorts by
-                             count descending (top_k not applied — threshold is the
-                             filter, matching the notebook approach).
+            strategy:      "pagerank" (default) or "citation_count"
+            min_citations: Minimum number of in-corpus papers that must cite a
+                           candidate for it to qualify (default 1).
 
         Returns:
-            List of paper IDs sorted descending by the chosen strategy score.
+            List of qualifying paper IDs sorted descending by strategy score.
             Never includes IDs already in papers_df.
-            Returns [] if citations_df is empty or all refs are already in corpus.
+            Returns [] if citations_df is empty or no candidates qualify.
         """
         if citations_df.empty:
             return []
 
-        corpus_ids = set(papers_df["paper_id"])
-        referenced_ids = (
-            set(citations_df["target"].dropna()) |
-            set(citations_df["source"].dropna())
-        )
-        candidates = referenced_ids - corpus_ids
+        canon = self._canonical_map(papers_df)
+        corpus_canonicals = set(canon.values())
+
+        # Translate citations through the canonical map so that corpus papers
+        # with multiple S2 IDs (same DOI) are treated as the same endpoint
+        norm_src = citations_df["source"].apply(lambda x: canon.get(x, x))
+        norm_tgt = citations_df["target"].apply(lambda x: canon.get(x, x))
+
+        referenced_ids = set(norm_tgt.dropna()) | set(norm_src.dropna())
+        candidates = referenced_ids - corpus_canonicals
+
+        if not candidates:
+            return []
+
+        # In-corpus citation count using DOI-normalized targets
+        counts = norm_tgt[norm_tgt.isin(candidates)].value_counts()
+        candidates = {cid for cid in candidates if counts.get(cid, 0) >= min_citations}
 
         if not candidates:
             return []
 
         if strategy == "citation_count":
-            counts = (
-                citations_df[citations_df["target"].isin(candidates)]["target"]
-                .value_counts()
-            )
-            # Mirror notebook threshold: 75th percentile of observed counts, minimum 3.
-            # Candidates with zero in-corpus citations are excluded automatically
-            # (they don't appear in counts at all).
-            threshold = int(max(3, counts.quantile(0.75))) if not counts.empty else 3
+            counts = counts[counts.index.isin(candidates)]
+            threshold = int(max(min_citations, counts.quantile(0.75))) if not counts.empty else min_citations
             qualifying = counts[counts >= threshold].index.tolist()
             return sorted(qualifying, key=lambda cid: counts[cid], reverse=True)
         else:
-            sorted_candidates = sorted(
-                candidates,
-                key=lambda cid: pagerank_scores.get(cid, 0.0),
-                reverse=True,
-            )
-            return sorted_candidates[:top_k]
+            candidate_scores = {
+                cid: pagerank_scores.get(cid, 0.0) for cid in candidates
+            }
+            score_series = pd.Series(candidate_scores)
+            threshold = float(score_series.quantile(0.75)) if not score_series.empty else 0.0
+            qualifying = score_series[score_series >= threshold].index.tolist()
+            return sorted(qualifying, key=lambda cid: candidate_scores[cid], reverse=True)

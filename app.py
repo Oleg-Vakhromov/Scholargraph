@@ -20,7 +20,7 @@ def _generate_bibtex(papers_df, cluster_labels=None):
 
         # Cluster tag
         cid = row.get("cluster_id")
-        if cid is not None and not (isinstance(cid, float) and pd.isna(cid)):
+        if cid is not None and not pd.isna(cid):
             cid_int = int(cid)
             label = labels.get(cid_int, f"cluster_{cid_int}")
             keywords = f"cluster:{label}"
@@ -146,8 +146,6 @@ if "bibcoupling_clusters" not in st.session_state:
     st.session_state["bibcoupling_clusters"] = None
 if "node_size_scale" not in st.session_state:
     st.session_state["node_size_scale"] = 1.0
-if "sentinel_loaded" not in st.session_state:
-    st.session_state["sentinel_loaded"] = False
 
 # ---------------------------------------------------------------------------
 # Sidebar — pipeline parameters
@@ -172,27 +170,6 @@ with st.sidebar:
     st.divider()
     st.subheader("Expansion")
 
-    max_iterations = st.number_input("Max iterations", min_value=1, max_value=20, value=3, step=1)
-    top_k_candidates = st.number_input("Top-K candidates", min_value=10, max_value=500, value=50, step=10)
-    relevance_threshold = st.slider(
-        "Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05
-    )
-
-    st.divider()
-    st.subheader("Embedding Model")
-    _MODEL_OPTIONS = {
-        "Fast (~90 MB)": "all-MiniLM-L6-v2",
-        "Balanced / High quality (~420 MB)": "all-mpnet-base-v2",
-        "Long-context multilingual (~2.2 GB)": "BAAI/bge-m3",
-    }
-    selected_model_label = st.selectbox(
-        "Embedding model",
-        options=list(_MODEL_OPTIONS.keys()),
-        index=0,
-        help="Controls relevance filtering during expansion. Faster models use less memory; larger models improve filtering quality for broad or multilingual queries.",
-    )
-    selected_model = _MODEL_OPTIONS[selected_model_label]
-
     _STRATEGY_OPTIONS = {
         "PageRank (graph-based)": "pagerank",
         "In-sample citation count": "citation_count",
@@ -201,10 +178,19 @@ with st.sidebar:
         "Ranking strategy",
         options=list(_STRATEGY_OPTIONS.keys()),
         index=0,
-        help="PageRank ranks candidates by structural importance in the full citation graph. "
-             "In-sample citation count ranks by how many corpus papers directly cite each candidate.",
+        help="Both strategies filter candidates by a 75th-percentile threshold rather than a top-K cap. "
+             "PageRank thresholds on graph score; In-sample citation count thresholds on ≥ max(3, 75th-percentile) "
+             "in-corpus citations, matching the classic bibliometric approach.",
     )
     selected_strategy = _STRATEGY_OPTIONS[selected_strategy_label]
+
+    max_iterations = st.number_input("Max iterations", min_value=1, max_value=20, value=3, step=1)
+    min_citations = st.number_input(
+        "Min. in-corpus citations",
+        min_value=1, max_value=20, value=1, step=1,
+        help="Minimum number of corpus papers that must cite a candidate for it to qualify. "
+             "Applies to both strategies before the 75th-percentile threshold.",
+    )
 
     apply_relevance_filter = st.checkbox(
         "Apply relevance filter",
@@ -212,19 +198,30 @@ with st.sidebar:
         help="Filter expansion candidates by cosine similarity to the query. "
              "Disable to add all structurally or citation-qualified candidates regardless of topical similarity.",
     )
+    relevance_threshold = st.slider(
+        "Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+        disabled=not apply_relevance_filter,
+    )
+
+    if apply_relevance_filter:
+        st.divider()
+        st.subheader("Embedding Model")
+        _MODEL_OPTIONS = {
+            "Fast (~90 MB)": "all-MiniLM-L6-v2",
+            "Balanced / High quality (~420 MB)": "all-mpnet-base-v2",
+            "Long-context multilingual (~2.2 GB)": "BAAI/bge-m3",
+        }
+        selected_model_label = st.selectbox(
+            "Embedding model",
+            options=list(_MODEL_OPTIONS.keys()),
+            index=0,
+            help="Controls relevance filtering during expansion. Faster models use less memory; larger models improve filtering quality for broad or multilingual queries.",
+        )
+        selected_model = _MODEL_OPTIONS[selected_model_label]
+    else:
+        selected_model = "all-MiniLM-L6-v2"
 
     run_button = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
-
-    _SENTINEL_PAPERS = Path("data/sentinel/papers.json")
-    if _SENTINEL_PAPERS.exists():
-        st.divider()
-        load_sentinel_button = st.button(
-            "Load Analyzed Graph",
-            help="Load pre-analyzed graph from the Sentinel pipeline (data/sentinel/)",
-            use_container_width=True,
-        )
-    else:
-        load_sentinel_button = False
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Seed corpus only
@@ -273,27 +270,6 @@ if run_button:
         st.session_state["corpus"] = corpus
         st.session_state["available_domains"] = corpus.extract_domains()
         st.session_state["seed_done"] = True
-
-if load_sentinel_button:
-    from src.sentinel.data_loader import SentinelDataLoader
-    with st.status("Loading Sentinel graph...", expanded=True) as _status:
-        _sentinel = SentinelDataLoader().load()
-        st.session_state["papers_df"] = _sentinel["papers_df"]
-        st.session_state["citations_df"] = _sentinel["citations_df"]
-        st.session_state["partition"] = _sentinel["partition"]
-        st.session_state["cluster_labels"] = None
-        st.session_state["cluster_summary"] = None
-        st.session_state["cluster_params"] = None
-        st.session_state["corpus"] = None
-        st.session_state["seed_done"] = True
-        st.session_state["sentinel_loaded"] = True
-        st.session_state["influence_df"] = None
-        st.session_state["cocitation_df"] = None
-        st.session_state["cocitation_clusters"] = None
-        st.session_state["bibcoupling_df"] = None
-        st.session_state["bibcoupling_clusters"] = None
-        st.write(f"Loaded {len(_sentinel['papers_df'])} papers, {len(_sentinel['citations_df'])} edges")
-        _status.update(label="Sentinel graph loaded", state="complete")
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Domain picker and pipeline continuation
@@ -363,6 +339,11 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
             _log("Expanding corpus...")
             expander = CorpusExpander(corpus._client, GraphEngine(), _load_filter(selected_model))
 
+            from src.enrichment.crossref import CrossRefClient
+            from src.enrichment.openalex import OpenAlexReferenceClient
+            _crossref = CrossRefClient()
+            _openalex = OpenAlexReferenceClient()
+
             def _report_iteration(iteration, seed_count, refs_extracted, new_papers):
                 _log(
                     f"Iteration {iteration}: "
@@ -370,15 +351,21 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
                     f"{refs_extracted} references extracted | "
                     f"{new_papers} new papers added"
                 )
+                _doi_filled, _doi_failed = corpus.enrich_dois(_crossref)
+                _log(f"  DOIs: {_doi_filled} filled, {_doi_failed} failed")
+                _venue_filled, _venue_failed = corpus.enrich_venues(_crossref)
+                _log(f"  Venues: {_venue_filled} filled, {_venue_failed} failed")
+                _refs_added, _refs_failed = corpus.enrich_references(_openalex)
+                _log(f"  References: {_refs_added} edges recovered, {_refs_failed} papers yielded nothing")
 
             expander.expand(
                 corpus,
                 query=query.strip(),
                 max_iterations=int(max_iterations),
-                top_k_candidates=int(top_k_candidates),
                 relevance_threshold=float(relevance_threshold),
                 expansion_strategy=selected_strategy,
                 apply_relevance_filter=apply_relevance_filter,
+                min_citations=int(min_citations),
                 allowed_domains=st.session_state.get("selected_domains") or None,
                 on_iteration=_report_iteration,
             )
@@ -448,7 +435,7 @@ if st.session_state["papers_df"] is not None:
     st.subheader("Papers")
     st.caption("All papers collected during seeding and expansion, ranked by citation count. Higher citation counts indicate greater influence in the field.")
     display_cols = [
-        c for c in ["title", "year", "journal", "citation_count", "authors", "doi_url"]
+        c for c in ["title", "year", "journal", "citation_count", "trend_score", "layer_tag", "authors", "doi_url"]
         if c in papers_df.columns
     ]
     st.dataframe(
@@ -554,13 +541,13 @@ if st.session_state["papers_df"] is not None:
     )
 
     _cocit_col1, _cocit_col2 = st.columns(2)
-    n_cocit_clusters = _cocit_col1.number_input(
-        "Co-citation clusters",
-        min_value=2,
-        max_value=20,
-        value=min(len(set(st.session_state["partition"].values())), 20) if st.session_state.get("partition") else 5,
-        step=1,
-        key="cocit_n_clusters",
+    cocit_resolution = _cocit_col1.slider(
+        "Resolution",
+        min_value=0.1,
+        max_value=1.0,
+        value=0.5,
+        step=0.05,
+        key="cocit_resolution",
     )
     min_cocitations = _cocit_col2.slider(
         "Min co-citations (edge threshold)",
@@ -570,7 +557,7 @@ if st.session_state["papers_df"] is not None:
         key="cocit_threshold",
     )
 
-    # Build co-citation matrix once; re-cluster on n_clusters change (fast)
+    # Build co-citation matrix once; re-cluster on resolution change (fast)
     if st.session_state.get("cocitation_df") is None:
         from src.analysis.cocitation import CoCitationAnalyzer
         _ca = CoCitationAnalyzer()
@@ -582,7 +569,7 @@ if st.session_state["papers_df"] is not None:
 
     from src.analysis.cocitation import CoCitationAnalyzer
     _coc_clusters = CoCitationAnalyzer().cluster_papers(
-        _coc_df, list(papers_df["paper_id"]), n_clusters=int(n_cocit_clusters)
+        _coc_df, list(papers_df["paper_id"]), resolution=cocit_resolution
     )
 
     # Filter edges by threshold
@@ -662,13 +649,13 @@ if st.session_state["papers_df"] is not None:
     )
 
     _bib_col1, _bib_col2 = st.columns(2)
-    n_bib_clusters = _bib_col1.number_input(
-        "Coupling clusters",
-        min_value=2,
-        max_value=20,
-        value=min(len(set(st.session_state["partition"].values())), 20) if st.session_state.get("partition") else 5,
-        step=1,
-        key="bib_n_clusters",
+    bib_resolution = _bib_col1.slider(
+        "Resolution",
+        min_value=0.1,
+        max_value=1.0,
+        value=0.5,
+        step=0.05,
+        key="bib_resolution",
     )
     min_coupling = _bib_col2.slider(
         "Min shared references (edge threshold)",
@@ -689,7 +676,7 @@ if st.session_state["papers_df"] is not None:
 
     from src.analysis.bibcoupling import BibliographicCoupler
     _bib_clusters = BibliographicCoupler().cluster_papers(
-        _bib_df, list(papers_df["paper_id"]), n_clusters=int(n_bib_clusters)
+        _bib_df, list(papers_df["paper_id"]), resolution=bib_resolution
     )
 
     _bib_filtered = _bib_df[_bib_df["coupling_strength"] >= min_coupling] if not _bib_df.empty else _bib_df
@@ -790,6 +777,25 @@ if st.session_state["papers_df"] is not None:
         _cluster_labels = _ce.label_clusters(papers_df, _partition)
         _cluster_summary = _ce.cluster_summary_df(papers_df, _cluster_labels)
 
+        from src.sentinel.scorer import Scorer
+        from src.sentinel.layerer import Layerer
+
+        papers_df = papers_df.drop(
+            columns=[c for c in ["layer_tag", "local_citation_count", "trend_score"] if c in papers_df.columns]
+        )
+        _score_input = papers_df.copy()
+        if "cluster_id" in _score_input.columns:
+            _score_input["cluster_id"] = _score_input["cluster_id"].fillna(-1).astype(int)
+        _papers_list = _score_input.to_dict("records")
+        _edges_list = (
+            citations_df[["source", "target"]].to_dict("records")
+            if citations_df is not None and not citations_df.empty else []
+        )
+        _scored = Scorer().score(_papers_list, _edges_list)
+        _tagged = Layerer().tag(_scored)
+        _tag_df = pd.DataFrame(_tagged)[["paper_id", "local_citation_count", "trend_score", "layer_tag"]]
+        papers_df = papers_df.merge(_tag_df, on="paper_id", how="left")
+
         st.session_state["papers_df"] = papers_df
         st.session_state["partition"] = _partition
         st.session_state["cluster_labels"] = _cluster_labels
@@ -802,6 +808,15 @@ if st.session_state["papers_df"] is not None:
             use_container_width=True,
             hide_index=True,
         )
+
+    if "layer_tag" in papers_df.columns:
+        _tag_counts = (
+            papers_df["layer_tag"]
+            .value_counts()
+            .rename_axis("layer_tag")
+            .reset_index(name="count")
+        )
+        st.dataframe(_tag_counts, use_container_width=True, hide_index=True)
 
     # -----------------------------------------------------------------------
     # Knowledge Graph
@@ -903,7 +918,7 @@ if st.session_state["papers_df"] is not None:
     if not evolution.empty:
         pivot = TemporalAnalyzer().evolution_pivot(evolution)
         pivot.columns = [
-            _labels.get(int(c), f"cluster-{int(c)}")
+            f"#{int(c)}: {_labels.get(int(c), f'cluster-{int(c)}')}"
             for c in pivot.columns
         ]
         st.line_chart(pivot)

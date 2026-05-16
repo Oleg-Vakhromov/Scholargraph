@@ -129,15 +129,13 @@ class CorpusBuilder:
             return self.papers_df
 
         domain_set = set(selected_domains)
-
         mask = [
             bool(value and domain_set.intersection(value))
             for value in self.papers_df["fields_of_study"]
         ]
-
         filtered_df = self.papers_df[mask].reset_index(drop=True)
 
-        if max_papers is not None and len(filtered_df) > max_papers:
+        if max_papers is not None:
             filtered_df = (
                 filtered_df
                 .sort_values("citation_count", ascending=False)
@@ -261,6 +259,220 @@ class CorpusBuilder:
 
         self.papers_df = df
         return self.papers_df
+
+    # ------------------------------------------------------------------
+    # Enrichment
+    # ------------------------------------------------------------------
+
+    def enrich_dois(self, crossref_client) -> tuple[int, int]:
+        """
+        Back-fill missing DOIs in papers_df using CrossRef.
+
+        Iterates rows where doi is None, queries CrossRef by title,
+        and updates doi + doi_url columns in-place.
+
+        Returns (filled, failed) counts for rows that were attempted.
+        """
+        if self.papers_df.empty:
+            return 0, 0
+
+        filled = 0
+        failed = 0
+        for idx, row in self.papers_df.iterrows():
+            if not pd.isna(self.papers_df.at[idx, "doi"]) and self.papers_df.at[idx, "doi"] is not None:
+                continue
+            title = row.get("title") if isinstance(row.get("title"), str) else None
+            if not title or not title.strip():
+                continue
+            year = row.get("year")
+            year = int(year) if pd.notna(year) else None
+            result = crossref_client.lookup(title, year=year)
+            if result is None:
+                failed += 1
+                continue
+            raw_doi = result.get("DOI")
+            if not raw_doi:
+                failed += 1
+                continue
+            doi = raw_doi.strip()
+            self.papers_df.at[idx, "doi"] = doi
+            self.papers_df.at[idx, "doi_url"] = f"https://doi.org/{doi}"
+            filled += 1
+            _cache = getattr(self._client, "_cache", None)
+            if _cache is not None:
+                pid = row.get("paper_id")
+                if pid and _cache.has_paper(pid):
+                    cached = dict(_cache.get_paper(pid))
+                    cached["doi"] = doi
+                    _cache.set_paper(pid, cached)
+
+        if filled and getattr(self._client, "_cache", None) is not None:
+            self._client._cache.save()
+
+        return filled, failed
+
+    def enrich_references(self, openalex_client) -> tuple[int, int]:
+        """
+        Recover missing citation edges for papers that have reference_count > 0
+        but no source rows in citations_df, using OpenAlex as the reference source.
+
+        Only intra-corpus edges are added: both source and target must exist in
+        papers_df (matched by normalized DOI). Self-loops are excluded.
+        Idempotent — duplicate (source, target) pairs are never added.
+
+        Returns (edges_added, papers_failed) where papers_failed is the count
+        of candidate papers for which OpenAlex returned no usable edges.
+        """
+        if self.papers_df.empty:
+            return 0
+
+        # Build normalized DOI → paper_id index
+        doi_index: dict = {}
+        for _, row in self.papers_df.iterrows():
+            raw_doi = row.get("doi")
+            if raw_doi is None or (isinstance(raw_doi, float) and pd.isna(raw_doi)):
+                continue
+            doi_str = str(raw_doi).strip()
+            if not doi_str:
+                continue
+            doi_str = doi_str.lstrip("https://doi.org/").lstrip("http://doi.org/").lower()
+            if doi_str:
+                doi_index[doi_str] = row["paper_id"]
+
+        # Find zero-reference candidates
+        if not self.citations_df.empty and "source" in self.citations_df.columns:
+            existing_sources = set(self.citations_df["source"])
+        else:
+            existing_sources = set()
+
+        candidates = self.papers_df[
+            (~self.papers_df["paper_id"].isin(existing_sources))
+            & (self.papers_df["reference_count"].notna())
+            & (self.papers_df["reference_count"] > 0)
+        ]
+
+        if candidates.empty:
+            return 0, 0
+
+        # Existing (source, target) pairs for dedup
+        if not self.citations_df.empty and "target" in self.citations_df.columns:
+            existing_pairs: set = set(
+                zip(self.citations_df["source"], self.citations_df["target"])
+            )
+        else:
+            existing_pairs = set()
+
+        new_rows = []
+        seen_pairs: set = set()
+        papers_failed = 0
+
+        for _, row in candidates.iterrows():
+            paper_id = row["paper_id"]
+            doi = row.get("doi")
+            if doi is not None and (isinstance(doi, float) and pd.isna(doi)):
+                doi = None
+            title = row.get("title")
+
+            refs = openalex_client.get_references(doi=doi, title=title)
+            edges_before = len(new_rows)
+            for ref in refs:
+                raw_ref_doi = ref.get("doi") or ""
+                norm_doi = raw_ref_doi.strip().lstrip("https://doi.org/").lstrip("http://doi.org/").lower()
+                if not norm_doi or norm_doi not in doi_index:
+                    continue
+                target_id = doi_index[norm_doi]
+                if target_id == paper_id:
+                    continue  # no self-loops
+                pair = (paper_id, target_id)
+                if pair in existing_pairs or pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                new_rows.append({
+                    "source": paper_id,
+                    "target": target_id,
+                    "title": ref.get("title"),
+                    "year": ref.get("year"),
+                })
+            if len(new_rows) == edges_before:
+                papers_failed += 1
+
+        if not new_rows:
+            return 0, papers_failed
+
+        new_df = pd.DataFrame(new_rows)
+        new_df["year"] = new_df["year"].astype("Int64")
+
+        if self.citations_df.empty:
+            self.citations_df = new_df.reset_index(drop=True)
+        else:
+            self.citations_df = pd.concat(
+                [self.citations_df, new_df], ignore_index=True
+            )
+
+        return len(new_rows), papers_failed
+
+    def enrich_venues(self, crossref_client) -> tuple[int, int]:
+        """
+        Back-fill missing journal/venue names in papers_df using CrossRef.
+
+        For rows where journal is None or empty:
+          - If doi is set: use crossref_client.lookup_by_doi(doi) — deterministic
+          - Else if title is set: use crossref_client.lookup(title, year) — fuzzy match
+        Extracts container-title[0] from the CrossRef work dict and updates
+        the journal column in-place.
+
+        Returns (filled, failed) counts for rows that were attempted.
+        """
+        if self.papers_df.empty:
+            return 0, 0
+
+        filled = 0
+        failed = 0
+        for idx, row in self.papers_df.iterrows():
+            current = self.papers_df.at[idx, "journal"]
+            if not (pd.isna(current) or current is None or str(current).strip() == ""):
+                continue
+
+            result = None
+            doi = row.get("doi")
+            if doi and pd.notna(doi) and str(doi).strip():
+                result = crossref_client.lookup_by_doi(str(doi).strip())
+
+            if result is None:
+                title = row.get("title")
+                if not title or not str(title).strip():
+                    continue
+                year = row.get("year")
+                year = int(year) if pd.notna(year) else None
+                result = crossref_client.lookup(str(title), year=year)
+
+            if result is None:
+                failed += 1
+                continue
+
+            container_titles = result.get("container-title") or []
+            if not container_titles:
+                failed += 1
+                continue
+            venue = container_titles[0].strip()
+            if not venue:
+                failed += 1
+                continue
+
+            self.papers_df.at[idx, "journal"] = venue
+            filled += 1
+            _cache = getattr(self._client, "_cache", None)
+            if _cache is not None:
+                pid = row.get("paper_id")
+                if pid and _cache.has_paper(pid):
+                    cached = dict(_cache.get_paper(pid))
+                    cached["journal"] = venue
+                    _cache.set_paper(pid, cached)
+
+        if filled and getattr(self._client, "_cache", None) is not None:
+            self._client._cache.save()
+
+        return filled, failed
 
     # ------------------------------------------------------------------
     # Diagnostics
