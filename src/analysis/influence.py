@@ -94,7 +94,8 @@ class InfluenceAnalyzer:
             df["betweenness_centrality"] = 0.0
             return df
 
-        scores = nx.betweenness_centrality(G.to_undirected())
+        k = min(G.number_of_nodes(), 200)
+        scores = nx.betweenness_centrality(G.to_undirected(), k=k, normalized=True)
         df["betweenness_centrality"] = (
             df["paper_id"].map(scores).fillna(0.0).round(4)
         )

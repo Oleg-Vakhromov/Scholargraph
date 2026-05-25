@@ -143,6 +143,10 @@ class CorpusExpander:
                     if c.source and c.target:
                         all_new_citations.append(c)
 
+            _cache = getattr(self._client, "_cache", None)
+            if _cache is not None:
+                _cache.save()
+
             new_citations_df = citations_to_df(all_new_citations)
 
             # 6. Append + deduplicate

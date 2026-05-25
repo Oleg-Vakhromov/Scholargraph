@@ -96,7 +96,18 @@ def _get_client():
         cache.load()
     except Exception:
         cache = None
-    return SemanticScholarClient(cache=cache)
+    api_key = os.environ.get("S2_API_KEY") or None
+    return SemanticScholarClient(cache=cache, api_key=api_key)
+
+
+@st.cache_resource
+def _get_scopus_client():
+    import os
+    api_key = os.environ.get("SCOPUS_API_KEY") or None
+    if not api_key:
+        return None
+    from src.api.scopus import ScopusClient
+    return ScopusClient(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +171,25 @@ with st.sidebar:
     st.header("Pipeline Parameters")
 
     query = st.text_input("Query", placeholder="e.g. knowledge graph embedding")
+
+    _scopus_available = _get_scopus_client() is not None
+    _source_options = ["Semantic Scholar", "Scopus", "Both (S2 + Scopus)"]
+    if not _scopus_available:
+        _source_help = "Set SCOPUS_API_KEY to enable Scopus sources."
+        _source_disabled = [False, True, True]
+    else:
+        _source_help = None
+        _source_disabled = [False, False, False]
+    search_source = st.radio(
+        "Search source",
+        options=_source_options,
+        index=0,
+        help=_source_help,
+        disabled=False,
+    )
+    if not _scopus_available and search_source != "Semantic Scholar":
+        search_source = "Semantic Scholar"
+
     limit = st.number_input("Seed limit", min_value=10, max_value=2000, value=200, step=50)
 
     col1, col2 = st.columns(2)
@@ -226,7 +256,7 @@ with st.sidebar:
     else:
         selected_model = "all-MiniLM-L6-v2"
 
-    run_button = st.button("▶ Run Pipeline", type="primary", use_container_width=True)
+    run_button = st.button("▶ Run Pipeline", type="primary", width='stretch')
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Seed corpus only
@@ -264,17 +294,32 @@ if run_button:
             from src.corpus.builder import CorpusBuilder
             client = _get_client()
             corpus = CorpusBuilder(client)
-            corpus.seed(query.strip(), limit=int(limit), year_range=year_range)
+            scopus = _get_scopus_client()
+
+            if search_source == "Scopus" and scopus:
+                corpus.seed_scopus(scopus, query.strip(), limit=int(limit), year_range=year_range)
+            elif search_source == "Both (S2 + Scopus)" and scopus:
+                corpus.seed_both(scopus, query.strip(), limit=int(limit), year_range=year_range)
+            else:
+                corpus.seed(query.strip(), limit=int(limit), year_range=year_range)
             if _scimago.is_loaded and not corpus.papers_df.empty:
                 corpus.papers_df = _scimago.enrich_papers(corpus.papers_df)
                 st.session_state["available_quartiles"] = _scimago.available_quartiles(corpus.papers_df)
                 st.session_state["scimago_loaded"] = True
-            st.write(f"Seed complete — {len(corpus.papers_df)} papers")
-            status.update(label="Seed complete", state="complete")
+            if corpus.papers_df.empty:
+                st.error(
+                    "Seed returned 0 papers. The Semantic Scholar API may not have results "
+                    "for this exact query — try rephrasing or broadening the search terms."
+                )
+                status.update(label="Seed failed — no papers found", state="error")
+            else:
+                st.write(f"Seed complete — {len(corpus.papers_df)} papers")
+                status.update(label="Seed complete", state="complete")
 
-        st.session_state["corpus"] = corpus
-        st.session_state["available_domains"] = corpus.extract_domains()
-        st.session_state["seed_done"] = True
+        if not corpus.papers_df.empty:
+            st.session_state["corpus"] = corpus
+            st.session_state["available_domains"] = corpus.extract_domains()
+            st.session_state["seed_done"] = True
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Domain picker and pipeline continuation
@@ -316,6 +361,7 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
         def _log(msg):
             st.session_state["pipeline_log"].append(msg)
             st.write(msg)
+            print(msg, flush=True)
 
         with st.status("Running pipeline...", expanded=True) as status:
             from src.expansion.expander import CorpusExpander
@@ -376,6 +422,21 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
             )
             _log(f"Expansion complete — {len(corpus.papers_df)} papers total")
 
+            # Scopus enrichment — fill venue/abstract/citation count gaps
+            _scopus = _get_scopus_client()
+            if _scopus is not None:
+                _log("Enriching from Scopus...")
+                _s_filled, _s_failed = corpus.enrich_from_scopus(_scopus)
+                _log(f"  Scopus: {_s_filled} papers enriched, {_s_failed} failed")
+
+            if corpus.papers_df.empty:
+                st.error(
+                    "Corpus is empty after filtering. All papers were removed by the "
+                    "domain or quartile filter — try selecting more domains or relaxing filters."
+                )
+                status.update(label="Pipeline failed — empty corpus", state="error")
+                st.stop()
+
             Path("data").mkdir(exist_ok=True)
             corpus.save_papers("data/papers.csv")
             if not corpus.citations_df.empty:
@@ -435,7 +496,7 @@ if st.session_state["papers_df"] is not None:
             _ranked.index = _ranked.index + 1
             _ranked.columns = ["Title", "LCI", "Global Citations"]
             _ranked["Title"] = _ranked["Title"].apply(lambda t: (str(t) or "")[:40])
-            st.dataframe(_ranked, use_container_width=True)
+            st.dataframe(_ranked, width='stretch')
 
     st.subheader("Papers")
     st.caption("All papers collected during seeding and expansion, ranked by citation count. Higher citation counts indicate greater influence in the field.")
@@ -445,7 +506,7 @@ if st.session_state["papers_df"] is not None:
     ]
     st.dataframe(
         papers_df[display_cols].sort_values("citation_count", ascending=False),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         column_config={
             "doi_url": st.column_config.LinkColumn("DOI", display_text="↗"),
@@ -485,7 +546,7 @@ if st.session_state["papers_df"] is not None:
     ]
     st.dataframe(
         _inf_display[_inf_cols].sort_values("isc", ascending=False),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         column_config={
             "doi_url": st.column_config.LinkColumn("DOI", display_text="↗"),
@@ -810,7 +871,7 @@ if st.session_state["papers_df"] is not None:
     if st.session_state["cluster_summary"] is not None:
         st.dataframe(
             st.session_state["cluster_summary"],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -821,7 +882,7 @@ if st.session_state["papers_df"] is not None:
             .rename_axis("layer_tag")
             .reset_index(name="count")
         )
-        st.dataframe(_tag_counts, use_container_width=True, hide_index=True)
+        st.dataframe(_tag_counts, width='stretch', hide_index=True)
 
     # -----------------------------------------------------------------------
     # Knowledge Graph

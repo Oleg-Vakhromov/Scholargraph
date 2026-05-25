@@ -5,7 +5,8 @@ from typing import List, Optional
 
 
 BASE_URL = "https://api.semanticscholar.org/graph/v1"
-_RATE_LIMIT_INTERVAL = 1.0  # seconds between requests (unauthenticated tier)
+_RATE_LIMIT_UNAUTH = 1.0   # seconds between requests — unauthenticated
+_RATE_LIMIT_AUTH   = 0.1   # seconds between requests — authenticated (10 req/s)
 _BATCH_SIZE = 500            # max paper IDs per /paper/batch call
 
 _DOI_URL_PREFIXES = re.compile(
@@ -15,15 +16,18 @@ _DOI_URL_PREFIXES = re.compile(
 
 
 class SemanticScholarClient:
-    def __init__(self, cache=None) -> None:
+    def __init__(self, cache=None, api_key: Optional[str] = None) -> None:
         """
         Args:
-            cache: Optional DiskCache instance. When provided, get_papers_batch()
-                   and get_references() skip already-cached IDs. search_bulk()
-                   is never cached — searches should always return fresh results.
+            cache:   Optional DiskCache instance.
+            api_key: Semantic Scholar API key. When provided, requests include
+                     the x-api-key header and the rate limit drops to 0.1 s
+                     (10 req/s). Defaults to the S2_API_KEY environment variable.
         """
         self._last_request_time: float = 0.0
         self._cache = cache
+        self._api_key: Optional[str] = api_key
+        self._rate_limit: float = _RATE_LIMIT_AUTH if api_key else _RATE_LIMIT_UNAUTH
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -31,20 +35,30 @@ class SemanticScholarClient:
 
     def _wait_for_rate_limit(self) -> None:
         elapsed = time.time() - self._last_request_time
-        if elapsed < _RATE_LIMIT_INTERVAL:
-            time.sleep(_RATE_LIMIT_INTERVAL - elapsed)
+        if elapsed < self._rate_limit:
+            time.sleep(self._rate_limit - elapsed)
+
+    def _headers(self) -> dict:
+        if self._api_key:
+            return {"x-api-key": self._api_key}
+        return {}
+
+    @staticmethod
+    def _should_retry(status_code: int) -> bool:
+        return status_code in (429, 500, 502, 503, 504)
 
     def _get(self, path: str, params: dict) -> dict:
-        delay = 60
-        for attempt in range(4):
+        delay = 10
+        response = None
+        for attempt in range(5):
             self._wait_for_rate_limit()
-            response = requests.get(f"{BASE_URL}{path}", params=params)
+            response = requests.get(f"{BASE_URL}{path}", params=params, headers=self._headers())
             self._last_request_time = time.time()
-            if response.status_code != 429:
+            if not self._should_retry(response.status_code):
                 break
-            if attempt < 3:
+            if attempt < 4:
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 120)
 
         if not response.ok:
             raise RuntimeError(
@@ -53,16 +67,17 @@ class SemanticScholarClient:
         return response.json()
 
     def _post(self, path: str, params: dict, body: dict) -> list:
-        delay = 60
-        for attempt in range(4):
+        delay = 10
+        response = None
+        for attempt in range(5):
             self._wait_for_rate_limit()
-            response = requests.post(f"{BASE_URL}{path}", params=params, json=body)
+            response = requests.post(f"{BASE_URL}{path}", params=params, json=body, headers=self._headers())
             self._last_request_time = time.time()
-            if response.status_code != 429:
+            if not self._should_retry(response.status_code):
                 break
-            if attempt < 3:
+            if attempt < 4:
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 120)
 
         if not response.ok:
             raise RuntimeError(
@@ -96,10 +111,14 @@ class SemanticScholarClient:
         sort: Optional[str] = None,
     ) -> List[dict]:
         """
-        GET /paper/search/bulk
+        GET /paper/search (offset-paginated)
 
-        Returns up to `limit` papers matching the query.
-        Handles pagination via the `token` cursor parameter.
+        Returns up to `limit` papers matching the query using the standard
+        search endpoint, which applies semantic/relevance ranking and matches
+        the result set shown on the Semantic Scholar website.
+
+        The /paper/search/bulk endpoint uses strict keyword matching and often
+        returns far fewer results for natural-language queries.
 
         Default fields: paperId, title, year, citationCount
         Not cached — searches should always return fresh results.
@@ -107,22 +126,38 @@ class SemanticScholarClient:
         if fields is None:
             fields = "paperId,title,year,citationCount"
 
-        params: dict = {"query": query, "fields": fields}
-        if sort:
-            params["sort"] = sort
-
         results: List[dict] = []
 
-        while len(results) < limit:
-            data = self._get("/paper/search/bulk", params)
-            batch = data.get("data", [])
-            results.extend(batch)
-
-            token = data.get("token")
-            if not token or not batch:
-                break
-
-            params["token"] = token
+        if limit > 1000:
+            # /paper/search/bulk — cursor-paginated, no offset cap
+            params: dict = {"query": query, "fields": fields}
+            if sort:
+                params["sort"] = sort
+            while len(results) < limit:
+                data = self._get("/paper/search/bulk", params)
+                batch = data.get("data", [])
+                results.extend(batch)
+                token = data.get("token")
+                if not token or not batch:
+                    break
+                params["token"] = token
+        else:
+            # /paper/search — semantic relevance ranking, offset + limit < 1000
+            offset = 0
+            page_size = min(100, limit)
+            while len(results) < limit:
+                page = min(page_size, limit - len(results), 999 - offset)
+                if page <= 0:
+                    break
+                params: dict = {"query": query, "fields": fields, "limit": page, "offset": offset}
+                if sort:
+                    params["sort"] = sort
+                data = self._get("/paper/search", params)
+                batch = data.get("data", [])
+                results.extend(batch)
+                if not batch or len(batch) < page:
+                    break
+                offset += len(batch)
 
         return results[:limit]
 
@@ -209,43 +244,9 @@ class SemanticScholarClient:
                         self._cache.set_paper(pid, paper)
 
             if i + _BATCH_SIZE < len(uncached_ids):
-                time.sleep(_RATE_LIMIT_INTERVAL)
+                time.sleep(self._rate_limit)
 
-        # Fallback: for papers missing venue or DOI, try /paper/search/match by title
-        for pid, paper in fetched.items():
-            needs_venue = paper.get("venue") is None
-            needs_doi = paper.get("doi") is None
-            if not (needs_venue or needs_doi):
-                continue
-            title = paper.get("title")
-            if not title:
-                continue
-            match = self.search_match(title)
-            if match is None:
-                continue
-
-            if needs_venue:
-                _journal = match.get("journal") or {}
-                _pub_venue = match.get("publicationVenue") or {}
-                _legacy_venue = match.get("venue")
-                resolved = _journal.get("name") or _pub_venue.get("name") or _legacy_venue or None
-                if resolved:
-                    paper["venue"] = resolved
-
-            if needs_doi:
-                ext_ids = match.get("externalIds") or {}
-                raw_doi = ext_ids.get("DOI") or ext_ids.get("doi") or None
-                normalized_doi = self._normalize_doi(raw_doi)
-                if normalized_doi:
-                    paper["doi"] = normalized_doi
-                    paper["doi_url"] = f"https://doi.org/{normalized_doi}"
-
-            if self._cache is not None:
-                self._cache.set_paper(pid, paper)
-
-        # Persist new entries
-        if self._cache is not None and fetched:
-            self._cache.save()
+        # Cache entries are written above; caller is responsible for cache.save()
 
         # Reconstruct result list in original input order
         all_results: List[dict] = []
@@ -333,7 +334,6 @@ class SemanticScholarClient:
 
         if self._cache is not None:
             self._cache.set_references(paper_id, citations)
-            self._cache.save()
 
         return citations
 
