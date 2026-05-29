@@ -100,15 +100,6 @@ def _get_client():
     return SemanticScholarClient(cache=cache, api_key=api_key)
 
 
-@st.cache_resource
-def _get_scopus_client():
-    import os
-    api_key = os.environ.get("SCOPUS_API_KEY") or None
-    if not api_key:
-        return None
-    from src.api.scopus import ScopusClient
-    return ScopusClient(api_key=api_key)
-
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -168,27 +159,9 @@ if "node_size_scale" not in st.session_state:
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Pipeline Parameters")
+    st.header("Search")
 
     query = st.text_input("Query", placeholder="e.g. knowledge graph embedding")
-
-    _scopus_available = _get_scopus_client() is not None
-    _source_options = ["Semantic Scholar", "Scopus", "Both (S2 + Scopus)"]
-    if not _scopus_available:
-        _source_help = "Set SCOPUS_API_KEY to enable Scopus sources."
-        _source_disabled = [False, True, True]
-    else:
-        _source_help = None
-        _source_disabled = [False, False, False]
-    search_source = st.radio(
-        "Search source",
-        options=_source_options,
-        index=0,
-        help=_source_help,
-        disabled=False,
-    )
-    if not _scopus_available and search_source != "Semantic Scholar":
-        search_source = "Semantic Scholar"
 
     limit = st.number_input("Seed limit", min_value=10, max_value=2000, value=200, step=50)
 
@@ -220,43 +193,48 @@ with st.sidebar:
     selected_strategy = _STRATEGY_OPTIONS[selected_strategy_label]
 
     max_iterations = st.number_input("Max iterations", min_value=1, max_value=20, value=3, step=1)
-    min_citations = st.number_input(
-        "Min. in-corpus citations",
-        min_value=1, max_value=20, value=1, step=1,
-        help="Minimum number of corpus papers that must cite a candidate for it to qualify. "
-             "Applies to both strategies before the 75th-percentile threshold.",
-    )
 
-    apply_relevance_filter = st.checkbox(
-        "Apply relevance filter",
-        value=True,
-        help="Filter expansion candidates by cosine similarity to the query. "
-             "Disable to add all structurally or citation-qualified candidates regardless of topical similarity.",
-    )
-    relevance_threshold = st.slider(
-        "Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05,
-        disabled=not apply_relevance_filter,
-    )
-
-    if apply_relevance_filter:
-        st.divider()
-        st.subheader("Embedding Model")
-        _MODEL_OPTIONS = {
-            "Fast (~90 MB)": "all-MiniLM-L6-v2",
-            "Balanced / High quality (~420 MB)": "all-mpnet-base-v2",
-            "Long-context multilingual (~2.2 GB)": "BAAI/bge-m3",
-        }
-        selected_model_label = st.selectbox(
-            "Embedding model",
-            options=list(_MODEL_OPTIONS.keys()),
-            index=0,
-            help="Controls relevance filtering during expansion. Faster models use less memory; larger models improve filtering quality for broad or multilingual queries.",
+    with st.expander("Advanced settings", expanded=False):
+        min_citations = st.number_input(
+            "Min. in-corpus citations",
+            min_value=1, max_value=20, value=1, step=1,
+            help="Minimum number of corpus papers that must cite a candidate for it to qualify. "
+                 "Applies to both strategies before the 75th-percentile threshold.",
         )
-        selected_model = _MODEL_OPTIONS[selected_model_label]
-    else:
-        selected_model = "all-MiniLM-L6-v2"
+
+        apply_relevance_filter = st.checkbox(
+            "Apply relevance filter",
+            value=True,
+            help="Filter expansion candidates by cosine similarity to the query. "
+                 "Disable to add all structurally or citation-qualified candidates regardless of topical similarity.",
+        )
+        relevance_threshold = st.slider(
+            "Relevance threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+            disabled=not apply_relevance_filter,
+        )
+
+        if apply_relevance_filter:
+            st.divider()
+            st.subheader("Embedding Model")
+            _MODEL_OPTIONS = {
+                "Fast (~90 MB)": "all-MiniLM-L6-v2",
+                "Balanced / High quality (~420 MB)": "all-mpnet-base-v2",
+                "Long-context multilingual (~2.2 GB)": "BAAI/bge-m3",
+            }
+            selected_model_label = st.selectbox(
+                "Embedding model",
+                options=list(_MODEL_OPTIONS.keys()),
+                index=0,
+                help="Controls relevance filtering during expansion. Faster models use less memory; larger models improve filtering quality for broad or multilingual queries.",
+            )
+            selected_model = _MODEL_OPTIONS[selected_model_label]
+        else:
+            selected_model = "all-MiniLM-L6-v2"
 
     run_button = st.button("▶ Run Pipeline", type="primary", width='stretch')
+
+    if not _scimago.is_loaded:
+        st.caption("ℹ SCImago data not found — quartile filter unavailable")
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Seed corpus only
@@ -294,22 +272,28 @@ if run_button:
             from src.corpus.builder import CorpusBuilder
             client = _get_client()
             corpus = CorpusBuilder(client)
-            scopus = _get_scopus_client()
-
-            if search_source == "Scopus" and scopus:
-                corpus.seed_scopus(scopus, query.strip(), limit=int(limit), year_range=year_range)
-            elif search_source == "Both (S2 + Scopus)" and scopus:
-                corpus.seed_both(scopus, query.strip(), limit=int(limit), year_range=year_range)
-            else:
+            try:
                 corpus.seed(query.strip(), limit=int(limit), year_range=year_range)
+            except RuntimeError as _e:
+                _msg = str(_e)
+                if "429" in _msg:
+                    st.error(
+                        "Semantic Scholar rate limit hit. Wait 1–2 minutes and try again, "
+                        "or apply for an API key at semanticscholar.org/product/api for higher limits."
+                    )
+                else:
+                    st.error(f"Seed failed: {_msg}")
+                status.update(label="Seed failed — API error", state="error")
+                st.stop()
             if _scimago.is_loaded and not corpus.papers_df.empty:
                 corpus.papers_df = _scimago.enrich_papers(corpus.papers_df)
                 st.session_state["available_quartiles"] = _scimago.available_quartiles(corpus.papers_df)
                 st.session_state["scimago_loaded"] = True
             if corpus.papers_df.empty:
                 st.error(
-                    "Seed returned 0 papers. The Semantic Scholar API may not have results "
-                    "for this exact query — try rephrasing or broadening the search terms."
+                    f'Seed returned 0 papers for "{query.strip()}". '
+                    "The Semantic Scholar API may not have results "
+                    "for this query — try rephrasing or broadening the search terms."
                 )
                 status.update(label="Seed failed — no papers found", state="error")
             else:
@@ -383,11 +367,14 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
 
             # Fetch references
             _log("Fetching references...")
-            corpus.fetch_references()
+            corpus.fetch_references(
+                on_progress=lambda n, t: _log(f"Fetching references… {n}/{t}")
+            )
             _log(f"References fetched — {len(corpus.citations_df)} citation edges")
 
             # Expand
             _log("Expanding corpus...")
+            _log("Loading embedding model…")
             expander = CorpusExpander(corpus._client, GraphEngine(), _load_filter(selected_model))
 
             from src.enrichment.crossref import CrossRefClient
@@ -422,13 +409,6 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
             )
             _log(f"Expansion complete — {len(corpus.papers_df)} papers total")
 
-            # Scopus enrichment — fill venue/abstract/citation count gaps
-            _scopus = _get_scopus_client()
-            if _scopus is not None:
-                _log("Enriching from Scopus...")
-                _s_filled, _s_failed = corpus.enrich_from_scopus(_scopus)
-                _log(f"  Scopus: {_s_filled} papers enriched, {_s_failed} failed")
-
             if corpus.papers_df.empty:
                 st.error(
                     "Corpus is empty after filtering. All papers were removed by the "
@@ -447,6 +427,16 @@ if st.session_state.get("seed_done") and st.session_state.get("corpus") is not N
             st.session_state["citations_df"] = corpus.citations_df
             st.session_state["corpus"] = corpus
             st.session_state["seed_done"] = False  # hide picker after completion
+            from src.sentinel.scorer import Scorer
+            _pre_score_input = corpus.papers_df.to_dict("records")
+            _pre_score_edges = (
+                corpus.citations_df[["source", "target"]].to_dict("records")
+                if not corpus.citations_df.empty else []
+            )
+            _pre_scored = Scorer().score(_pre_score_input, _pre_score_edges)
+            st.session_state["pre_scored_df"] = pd.DataFrame(_pre_scored)[
+                ["paper_id", "local_citation_count", "trend_score"]
+            ]
             status.update(label="Pipeline complete!", state="complete")
 
 # ---------------------------------------------------------------------------
@@ -478,9 +468,24 @@ if st.session_state["papers_df"] is not None:
         "Standard":        "#95a5a6",
     }
 
-    col1, col2 = st.columns(2)
-    col1.metric("Total papers", len(papers_df))
-    col2.metric("Total citations", len(citations_df) if citations_df is not None else 0)
+    _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
+    _mc1.metric("Total papers", len(papers_df))
+    _mc2.metric("Total citations", len(citations_df) if citations_df is not None else 0)
+    if _mc3.button("✕ Clear results"):
+        for _k in [
+            "papers_df", "citations_df", "corpus", "partition", "cluster_labels",
+            "cluster_summary", "influence_df", "cocitation_df", "cocitation_clusters",
+            "bibcoupling_df", "bibcoupling_clusters", "graph", "pre_scored_df",
+            "cluster_params",
+        ]:
+            st.session_state[_k] = None
+        st.session_state["seed_done"] = False
+        st.session_state["available_domains"] = []
+        st.session_state["selected_domains"] = []
+        st.session_state["available_quartiles"] = []
+        st.session_state["selected_quartiles"] = []
+        st.session_state["pipeline_log"] = []
+        st.rerun()
 
     if "local_citation_count" in papers_df.columns:
         with st.sidebar:
@@ -521,26 +526,21 @@ if st.session_state["papers_df"] is not None:
     st.caption(
         "Papers ranked by in-sample citations (ISC) — how often they are cited "
         "by other papers within this corpus. ISC ratio shows what fraction of a "
-        "paper's total Semantic Scholar citations come from within the corpus. "
-        "Betweenness centrality identifies papers that act as bridges between "
-        "research clusters."
+        "paper's total Semantic Scholar citations come from within the corpus."
     )
 
     if st.session_state.get("influence_df") is None:
         from src.analysis.influence import InfluenceAnalyzer
-        from src.graph.engine import GraphEngine
 
         ia = InfluenceAnalyzer()
         _inf_df = ia.compute_isc(papers_df, st.session_state["citations_df"])
-        _G_inf = GraphEngine().build_graph(papers_df, st.session_state["citations_df"])
-        _inf_df = ia.compute_betweenness(_G_inf, _inf_df)
         st.session_state["influence_df"] = _inf_df
 
     _inf_display = st.session_state["influence_df"]
     _inf_cols = [
         c for c in [
             "title", "year", "journal", "citation_count",
-            "isc", "isc_ratio", "sample_relevance", "betweenness_centrality", "doi_url",
+            "isc", "isc_ratio", "sample_relevance", "doi_url",
         ]
         if c in _inf_display.columns
     ]
@@ -561,252 +561,262 @@ if st.session_state["papers_df"] is not None:
     )
 
     # -----------------------------------------------------------------------
-    # Graph Display Settings
+    # Graph tabs — Co-citation, Bibliographic Coupling, Knowledge Graph
     # -----------------------------------------------------------------------
     st.divider()
-    st.subheader("Graph Display Settings")
-    st.caption("Node size metric and scale apply to all graph visualisations below.")
-
-    _gds_col1, _gds_col2, _gds_col3 = st.columns([4, 1, 1])
-    _node_size_metric = _gds_col1.selectbox(
-        "Node size metric",
-        options=["isc", "citation_count", "isc_ratio", "sample_relevance", "betweenness_centrality"],
-        index=0,
-        key="node_size_metric",
-    )
-    _gds_col2.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
-    if _gds_col2.button("－ Size"):
-        st.session_state["node_size_scale"] = max(st.session_state["node_size_scale"] / 1.3, 0.1)
-    _gds_col3.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
-    if _gds_col3.button("＋ Size"):
-        st.session_state["node_size_scale"] = min(st.session_state["node_size_scale"] * 1.3, 10.0)
-    _node_scale = st.session_state["node_size_scale"]
-
-    # Build metric lookup from influence_df (covers all paper_ids in corpus)
-    _inf_for_sizing = st.session_state["influence_df"]
-    if _inf_for_sizing is not None and _node_size_metric in _inf_for_sizing.columns:
-        _metric_lookup = dict(zip(_inf_for_sizing["paper_id"], _inf_for_sizing[_node_size_metric].fillna(0)))
-        _metric_max = float(max(_inf_for_sizing[_node_size_metric].fillna(0).max(), 1e-9))
-    else:
-        _metric_lookup = {}
-        _metric_max = 1.0
-
-    def _sized(paper_id):
-        val = _metric_lookup.get(paper_id, 0)
-        return float(max((10 + 30 * (val / _metric_max)) * _node_scale, 5))
-
-    # -----------------------------------------------------------------------
-    # Co-citation Analysis
-    # -----------------------------------------------------------------------
-    st.divider()
-    st.subheader("Co-citation Analysis")
-    st.caption(
-        "Papers frequently cited together by the same sources are likely intellectually "
-        "related, even without a direct citation link. AgglomerativeClustering groups "
-        "co-cited papers into themes; node colour reflects cluster membership."
+    _graph_tab1, _graph_tab2, _graph_tab3 = st.tabs(
+        ["Co-citation Analysis", "Bibliographic Coupling", "Knowledge Graph"]
     )
 
-    _cocit_col1, _cocit_col2 = st.columns(2)
-    cocit_resolution = _cocit_col1.slider(
-        "Resolution",
-        min_value=0.1,
-        max_value=1.0,
-        value=0.5,
-        step=0.05,
-        key="cocit_resolution",
-    )
-    min_cocitations = _cocit_col2.slider(
-        "Min co-citations (edge threshold)",
-        min_value=1,
-        max_value=10,
-        value=2,
-        key="cocit_threshold",
-    )
+    with _graph_tab1:
+        st.caption(
+            "Papers frequently cited together by the same sources are likely intellectually "
+            "related, even without a direct citation link. Communities detected via "
+            "Girvan-Newman; edges filtered to top 1% by co-citation count."
+        )
 
-    # Build co-citation matrix once; re-cluster on resolution change (fast)
-    if st.session_state.get("cocitation_df") is None:
+        _coc_decile_col, _ = st.columns(2)
+        _coc_decile = _coc_decile_col.slider(
+            "Edge density (decile threshold)",
+            min_value=0.90, max_value=1.0, value=0.99, step=0.01,
+            key="cocit_decile",
+        )
+
+        if st.session_state.get("cocitation_df") is None:
+            from src.analysis.cocitation import CoCitationAnalyzer
+            _ca = CoCitationAnalyzer()
+            st.session_state["cocitation_df"] = _ca.build_cocitation_matrix(
+                citations_df, set(papers_df["paper_id"])
+            )
+
+        _coc_df = st.session_state["cocitation_df"]
+        _coc_title_lookup = dict(zip(papers_df["paper_id"], papers_df["title"]))
+
         from src.analysis.cocitation import CoCitationAnalyzer
-        _ca = CoCitationAnalyzer()
-        st.session_state["cocitation_df"] = _ca.build_cocitation_matrix(
-            citations_df, set(papers_df["paper_id"])
+        _coc_G, _coc_communities, _coc_filtered = CoCitationAnalyzer().build_spring_graph(
+            _coc_df, _coc_title_lookup, decile=_coc_decile
         )
 
-    _coc_df = st.session_state["cocitation_df"]
+        if _coc_G.number_of_nodes() == 0:
+            st.info("No co-citation pairs meet the density threshold — try lowering the decile.")
+        else:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import networkx as nx
 
-    from src.analysis.cocitation import CoCitationAnalyzer
-    _coc_clusters = CoCitationAnalyzer().cluster_papers(
-        _coc_df, list(papers_df["paper_id"]), resolution=cocit_resolution
-    )
+            _coc_fig, _coc_ax = plt.subplots(figsize=(14, 10))
+            _coc_pos = nx.spring_layout(_coc_G, k=0.8, seed=42)
+            _coc_cmap = plt.cm.tab10
+            _coc_colors = [_coc_cmap(_coc_communities.get(n, 0) % 10) for n in _coc_G.nodes()]
+            nx.draw_networkx_nodes(_coc_G, _coc_pos, node_color=_coc_colors,
+                                   node_size=300, edgecolors="black", ax=_coc_ax)
+            nx.draw_networkx_edges(_coc_G, _coc_pos, alpha=0.5, ax=_coc_ax)
+            _coc_labels = nx.get_node_attributes(_coc_G, "label")
+            nx.draw_networkx_labels(_coc_G, _coc_pos, labels=_coc_labels, font_size=7, ax=_coc_ax)
+            _coc_edge_labels = nx.get_edge_attributes(_coc_G, "weight")
+            nx.draw_networkx_edge_labels(_coc_G, _coc_pos, edge_labels=_coc_edge_labels,
+                                         font_size=6, ax=_coc_ax)
+            _coc_ax.axis("off")
+            st.pyplot(_coc_fig)
+            plt.close(_coc_fig)
 
-    # Filter edges by threshold
-    _coc_filtered = _coc_df[_coc_df["cocitation_count"] >= min_cocitations] if not _coc_df.empty else _coc_df
-
-    if _coc_filtered.empty:
-        st.info("No paper pairs meet the minimum co-citation threshold.")
-    else:
-        from pyvis.network import Network
-        import streamlit.components.v1 as components
-
-        _title_lookup = dict(zip(papers_df["paper_id"], papers_df["title"]))
-
-        _coc_net = Network(
-            height="500px",
-            width="100%",
-            bgcolor="#e8e8e8",
-            font_color="#222222",
-            directed=False,
-        )
-        _coc_net.barnes_hut()
-
-        # Collect nodes from filtered edges
-        _coc_node_ids = set(_coc_filtered["paper_a"]) | set(_coc_filtered["paper_b"])
-        for _pid in _coc_node_ids:
-            _cid = _coc_clusters.get(_pid, -1)
-            _color = _PALETTE[_cid % len(_PALETTE)] if _cid >= 0 else "#888888"
-            _label = (_title_lookup.get(_pid) or "")[:40]
-            _coc_net.add_node(
-                _pid,
-                label=_label,
-                title=_title_lookup.get(_pid) or _pid,
-                color=_color,
-                size=_sized(_pid),
+            _coc_export_rows = [
+                {
+                    "community_from": _coc_communities.get(_e["paper_a"], -1),
+                    "from_paper_name": _coc_title_lookup.get(_e["paper_a"], _e["paper_a"]),
+                    "community_to": _coc_communities.get(_e["paper_b"], -1),
+                    "to_paper_name": _coc_title_lookup.get(_e["paper_b"], _e["paper_b"]),
+                    "cocitation_count": _e["cocitation_count"],
+                }
+                for _, _e in _coc_filtered.iterrows()
+            ]
+            st.download_button(
+                "⬇ Export view as CSV",
+                data=pd.DataFrame(_coc_export_rows).to_csv(index=False).encode("utf-8"),
+                file_name="cocitation_view.csv",
+                mime="text/csv",
+                key="cocit_export_csv",
             )
 
-        for _, _edge in _coc_filtered.iterrows():
-            _width = min(1 + _edge["cocitation_count"] * 0.5, 10)
-            _coc_net.add_edge(
-                _edge["paper_a"],
-                _edge["paper_b"],
-                value=float(_width),
-            )
-
-        _coc_html = _coc_net.generate_html()
-        components.html(_coc_html, height=510, scrolling=False)
-
-        _coc_btn_col1, _coc_btn_col2 = st.columns(2)
-        _graph_tab_button(_coc_net, _coc_html, _coc_btn_col1, "cocitation_graph.html")
-
-        _coc_export_rows = [
-            {
-                "cluster_from": _coc_clusters.get(_e["paper_a"], -1),
-                "from_paper_name": _title_lookup.get(_e["paper_a"], _e["paper_a"]),
-                "cluster_to": _coc_clusters.get(_e["paper_b"], -1),
-                "to_paper_name": _title_lookup.get(_e["paper_b"], _e["paper_b"]),
-            }
-            for _, _e in _coc_filtered.iterrows()
-        ]
-        _coc_btn_col2.download_button(
-            "⬇ Export view as CSV",
-            data=pd.DataFrame(_coc_export_rows).to_csv(index=False).encode("utf-8"),
-            file_name="cocitation_view.csv",
-            mime="text/csv",
-            key="cocit_export_csv",
+    with _graph_tab2:
+        st.caption(
+            "Papers that cite the same sources share intellectual foundations and are "
+            "likely working in the same research area, even without directly referencing "
+            "each other. Communities detected via Girvan-Newman; edges filtered to top 1% "
+            "by shared-reference count."
         )
 
-    # -----------------------------------------------------------------------
-    # Bibliographic Coupling
-    # -----------------------------------------------------------------------
-    st.divider()
-    st.subheader("Bibliographic Coupling")
-    st.caption(
-        "Papers that cite the same sources share intellectual foundations and are "
-        "likely working in the same research area, even without directly referencing "
-        "each other. Edge weight reflects the number of shared references."
-    )
+        _bib_decile_col, _ = st.columns(2)
+        _bib_decile = _bib_decile_col.slider(
+            "Edge density (decile threshold)",
+            min_value=0.90, max_value=1.0, value=0.99, step=0.01,
+            key="bib_decile",
+        )
 
-    _bib_col1, _bib_col2 = st.columns(2)
-    bib_resolution = _bib_col1.slider(
-        "Resolution",
-        min_value=0.1,
-        max_value=1.0,
-        value=0.5,
-        step=0.05,
-        key="bib_resolution",
-    )
-    min_coupling = _bib_col2.slider(
-        "Min shared references (edge threshold)",
-        min_value=1,
-        max_value=10,
-        value=2,
-        key="bib_threshold",
-    )
+        if st.session_state.get("bibcoupling_df") is None:
+            from src.analysis.bibcoupling import BibliographicCoupler
+            _bc = BibliographicCoupler()
+            st.session_state["bibcoupling_df"] = _bc.build_coupling_matrix(
+                citations_df, set(papers_df["paper_id"])
+            )
 
-    if st.session_state.get("bibcoupling_df") is None:
+        _bib_df = st.session_state["bibcoupling_df"]
+        _bib_title_lookup = dict(zip(papers_df["paper_id"], papers_df["title"]))
+
         from src.analysis.bibcoupling import BibliographicCoupler
-        _bc = BibliographicCoupler()
-        st.session_state["bibcoupling_df"] = _bc.build_coupling_matrix(
-            citations_df, set(papers_df["paper_id"])
+        _bib_G, _bib_communities, _bib_filtered = BibliographicCoupler().build_spring_graph(
+            _bib_df, _bib_title_lookup, decile=_bib_decile
         )
 
-    _bib_df = st.session_state["bibcoupling_df"]
+        if _bib_G.number_of_nodes() == 0:
+            st.info("No bibliographic coupling pairs meet the density threshold — try lowering the decile.")
+        else:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import networkx as nx
 
-    from src.analysis.bibcoupling import BibliographicCoupler
-    _bib_clusters = BibliographicCoupler().cluster_papers(
-        _bib_df, list(papers_df["paper_id"]), resolution=bib_resolution
-    )
+            _bib_fig, _bib_ax = plt.subplots(figsize=(14, 10))
+            _bib_pos = nx.spring_layout(_bib_G, k=0.8, seed=42)
+            _bib_cmap = plt.cm.tab10
+            _bib_colors = [_bib_cmap(_bib_communities.get(n, 0) % 10) for n in _bib_G.nodes()]
+            nx.draw_networkx_nodes(_bib_G, _bib_pos, node_color=_bib_colors,
+                                   node_size=300, edgecolors="black", ax=_bib_ax)
+            nx.draw_networkx_edges(_bib_G, _bib_pos, alpha=0.5, ax=_bib_ax)
+            _bib_labels = nx.get_node_attributes(_bib_G, "label")
+            nx.draw_networkx_labels(_bib_G, _bib_pos, labels=_bib_labels, font_size=7, ax=_bib_ax)
+            _bib_edge_labels = nx.get_edge_attributes(_bib_G, "weight")
+            nx.draw_networkx_edge_labels(_bib_G, _bib_pos, edge_labels=_bib_edge_labels,
+                                         font_size=6, ax=_bib_ax)
+            _bib_ax.axis("off")
+            st.pyplot(_bib_fig)
+            plt.close(_bib_fig)
 
-    _bib_filtered = _bib_df[_bib_df["coupling_strength"] >= min_coupling] if not _bib_df.empty else _bib_df
+            _bib_export_rows = [
+                {
+                    "community_from": _bib_communities.get(_e["paper_a"], -1),
+                    "from_paper_name": _bib_title_lookup.get(_e["paper_a"], _e["paper_a"]),
+                    "community_to": _bib_communities.get(_e["paper_b"], -1),
+                    "to_paper_name": _bib_title_lookup.get(_e["paper_b"], _e["paper_b"]),
+                    "coupling_strength": _e["coupling_strength"],
+                }
+                for _, _e in _bib_filtered.iterrows()
+            ]
+            st.download_button(
+                "⬇ Export view as CSV",
+                data=pd.DataFrame(_bib_export_rows).to_csv(index=False).encode("utf-8"),
+                file_name="bibcoupling_view.csv",
+                mime="text/csv",
+                key="bib_export_csv",
+            )
 
-    if _bib_filtered.empty:
-        st.info("No paper pairs meet the minimum shared-reference threshold.")
-    else:
-        from pyvis.network import Network
-        import streamlit.components.v1 as components
+    with _graph_tab3:
+        st.caption("Citation network. Node size reflects the selected metric; node colour reflects cluster or layer membership. Arrows point from citing paper to cited paper.")
 
-        _title_lookup_bib = dict(zip(papers_df["paper_id"], papers_df["title"]))
-
-        _bib_net = Network(
-            height="500px",
-            width="100%",
-            bgcolor="#e8e8e8",
-            font_color="#222222",
-            directed=False,
+        # Node size controls — only apply to this graph
+        _gds_col1, _gds_col2, _gds_col3 = st.columns([4, 1, 1])
+        _node_size_metric = _gds_col1.selectbox(
+            "Node size metric",
+            options=["citation_count", "isc", "isc_ratio", "sample_relevance"],
+            index=0,
+            key="node_size_metric",
         )
-        _bib_net.barnes_hut()
+        _gds_col2.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
+        if _gds_col2.button("－ Size"):
+            st.session_state["node_size_scale"] = max(st.session_state["node_size_scale"] / 1.3, 0.1)
+        _gds_col3.markdown('<div style="padding-top:27px"></div>', unsafe_allow_html=True)
+        if _gds_col3.button("＋ Size"):
+            st.session_state["node_size_scale"] = min(st.session_state["node_size_scale"] * 1.3, 10.0)
+        _node_scale = st.session_state["node_size_scale"]
 
-        _bib_node_ids = set(_bib_filtered["paper_a"]) | set(_bib_filtered["paper_b"])
-        for _pid in _bib_node_ids:
-            _cid = _bib_clusters.get(_pid, -1)
-            _color = _PALETTE[_cid % len(_PALETTE)] if _cid >= 0 else "#888888"
-            _label = (_title_lookup_bib.get(_pid) or "")[:40]
-            _bib_net.add_node(
-                _pid,
-                label=_label,
-                title=_title_lookup_bib.get(_pid) or _pid,
-                color=_color,
-                size=_sized(_pid),
+        max_nodes = st.slider(
+            "Max nodes", min_value=20, max_value=500, value=50, step=20,
+            key="graph_max_nodes",
+        )
+
+        papers_for_graph = (
+            st.session_state["papers_df"]
+            .fillna({"citation_count": 0})
+            .sort_values("citation_count", ascending=False)
+            .head(max_nodes)
+            .reset_index(drop=True)
+        )
+        node_ids = set(papers_for_graph["paper_id"])
+
+        citations_df_kg = st.session_state["citations_df"]
+        _visible_edges = pd.DataFrame()
+        if citations_df_kg is not None and not citations_df_kg.empty:
+            _visible_edges = citations_df_kg[
+                citations_df_kg["source"].isin(node_ids) & citations_df_kg["target"].isin(node_ids)
+            ]
+
+        # Node sizes: use citation_count from papers_for_graph as always-available base;
+        # merge influence metrics when available
+        _size_series = papers_for_graph["citation_count"].fillna(0)
+        _inf_df = st.session_state["influence_df"]
+        if _inf_df is not None and _node_size_metric in _inf_df.columns:
+            _size_merged = papers_for_graph[["paper_id"]].merge(
+                _inf_df[["paper_id", _node_size_metric]], on="paper_id", how="left"
             )
+            _size_series = _size_merged[_node_size_metric].fillna(0)
+        elif _node_size_metric == "citation_count":
+            _size_series = papers_for_graph["citation_count"].fillna(0)
+        _size_max = float(max(_size_series.max(), 1e-9))
 
-        for _, _edge in _bib_filtered.iterrows():
-            _width = min(1 + _edge["coupling_strength"] * 0.5, 10)
-            _bib_net.add_edge(
-                _edge["paper_a"],
-                _edge["paper_b"],
-                value=float(_width),
-            )
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import networkx as nx
 
-        _bib_html = _bib_net.generate_html()
-        components.html(_bib_html, height=510, scrolling=False)
+        G_kg = nx.DiGraph()
+        _kg_node_colors = []
+        _kg_node_sizes = []
+        for i, row in papers_for_graph.iterrows():
+            pid = row["paper_id"]
+            G_kg.add_node(pid, label=(row["title"] or "")[:35])
+            if "layer_tag" in papers_for_graph.columns:
+                _kg_node_colors.append(_LAYER_COLORS.get(row.get("layer_tag"), "#888888"))
+            else:
+                cid = int(row["cluster_id"]) if pd.notna(row.get("cluster_id")) else -1
+                _kg_node_colors.append(_PALETTE[cid % len(_PALETTE)] if cid >= 0 else "#888888")
+            _val = float(_size_series.iloc[i])
+            _kg_node_sizes.append(max(50.0, (_val / _size_max) * 600.0 * _node_scale + 50.0))
 
-        _bib_btn_col1, _bib_btn_col2 = st.columns(2)
-        _graph_tab_button(_bib_net, _bib_html, _bib_btn_col1, "bibcoupling_graph.html")
+        for _, edge in _visible_edges.iterrows():
+            G_kg.add_edge(edge["source"], edge["target"])
 
-        _bib_export_rows = [
+        _kg_fig, _kg_ax = plt.subplots(figsize=(14, 10))
+        _kg_pos = nx.spring_layout(G_kg, k=0.8, seed=42)
+        nx.draw_networkx_nodes(G_kg, _kg_pos, node_color=_kg_node_colors,
+                               node_size=_kg_node_sizes, edgecolors="black", ax=_kg_ax)
+        nx.draw_networkx_edges(G_kg, _kg_pos, alpha=0.4, arrows=True,
+                               arrowstyle="-|>", arrowsize=12, ax=_kg_ax)
+        _kg_labels = nx.get_node_attributes(G_kg, "label")
+        nx.draw_networkx_labels(G_kg, _kg_pos, labels=_kg_labels, font_size=6, ax=_kg_ax)
+        _kg_ax.axis("off")
+        st.pyplot(_kg_fig)
+        plt.close(_kg_fig)
+
+        _kg_pid_cluster = dict(zip(papers_for_graph["paper_id"], papers_for_graph.get("cluster_id", pd.Series(dtype=int)).fillna(-1).astype(int)))
+        _kg_pid_title = dict(zip(papers_for_graph["paper_id"], papers_for_graph["title"]))
+        _kg_export_rows = [
             {
-                "cluster_from": _bib_clusters.get(_e["paper_a"], -1),
-                "from_paper_name": _title_lookup_bib.get(_e["paper_a"], _e["paper_a"]),
-                "cluster_to": _bib_clusters.get(_e["paper_b"], -1),
-                "to_paper_name": _title_lookup_bib.get(_e["paper_b"], _e["paper_b"]),
+                "cluster_from": _kg_pid_cluster.get(edge["source"], -1),
+                "from_paper_name": _kg_pid_title.get(edge["source"], edge["source"]),
+                "cluster_to": _kg_pid_cluster.get(edge["target"], -1),
+                "to_paper_name": _kg_pid_title.get(edge["target"], edge["target"]),
             }
-            for _, _e in _bib_filtered.iterrows()
-        ]
-        _bib_btn_col2.download_button(
-            "⬇ Export view as CSV",
-            data=pd.DataFrame(_bib_export_rows).to_csv(index=False).encode("utf-8"),
-            file_name="bibcoupling_view.csv",
-            mime="text/csv",
-            key="bib_export_csv",
-        )
+            for _, edge in _visible_edges.iterrows()
+        ] if not _visible_edges.empty else []
+        if _kg_export_rows:
+            st.download_button(
+                "⬇ Export view as CSV",
+                data=pd.DataFrame(_kg_export_rows).to_csv(index=False).encode("utf-8"),
+                file_name="knowledge_graph_view.csv",
+                mime="text/csv",
+                key="kg_export_csv",
+            )
 
     # -----------------------------------------------------------------------
     # Cluster analysis
@@ -833,9 +843,12 @@ if st.session_state["papers_df"] is not None:
 
     if st.session_state.get("cluster_params") != _current_params or "cluster_id" not in papers_df.columns:
         from src.analysis.cluster import ClusterEngine
-        from src.graph.engine import GraphEngine
 
-        _G_cl = GraphEngine().build_graph(papers_df, citations_df)
+        _G_cl = st.session_state.get("graph")
+        if _G_cl is None:
+            from src.graph.engine import GraphEngine
+            _G_cl = GraphEngine().build_graph(papers_df, citations_df)
+            st.session_state["graph"] = _G_cl
         _ce = ClusterEngine()
         _partition = _ce.detect_communities(_G_cl, resolution=float(cluster_resolution))
         _partition = _ce.merge_small_clusters(_partition, papers_df, citations_df, min_size=int(min_cluster_size))
@@ -843,23 +856,33 @@ if st.session_state["papers_df"] is not None:
         _cluster_labels = _ce.label_clusters(papers_df, _partition)
         _cluster_summary = _ce.cluster_summary_df(papers_df, _cluster_labels)
 
-        from src.sentinel.scorer import Scorer
         from src.sentinel.layerer import Layerer
 
         papers_df = papers_df.drop(
             columns=[c for c in ["layer_tag", "local_citation_count", "trend_score"] if c in papers_df.columns]
         )
-        _score_input = papers_df.copy()
-        if "cluster_id" in _score_input.columns:
-            _score_input["cluster_id"] = _score_input["cluster_id"].fillna(-1).astype(int)
-        _papers_list = _score_input.to_dict("records")
-        _edges_list = (
-            citations_df[["source", "target"]].to_dict("records")
-            if citations_df is not None and not citations_df.empty else []
-        )
-        _scored = Scorer().score(_papers_list, _edges_list)
-        _tagged = Layerer().tag(_scored)
-        _tag_df = pd.DataFrame(_tagged)[["paper_id", "local_citation_count", "trend_score", "layer_tag"]]
+        _pre_scored_df = st.session_state.get("pre_scored_df")
+        if _pre_scored_df is not None:
+            papers_df = papers_df.merge(_pre_scored_df, on="paper_id", how="left")
+        else:
+            from src.sentinel.scorer import Scorer
+            _score_input = papers_df.copy()
+            if "cluster_id" in _score_input.columns:
+                _score_input["cluster_id"] = _score_input["cluster_id"].fillna(-1).astype(int)
+            _papers_list = _score_input.to_dict("records")
+            _edges_list = (
+                citations_df[["source", "target"]].to_dict("records")
+                if citations_df is not None and not citations_df.empty else []
+            )
+            _pre_scored_df = pd.DataFrame(Scorer().score(_papers_list, _edges_list))[
+                ["paper_id", "local_citation_count", "trend_score"]
+            ]
+            papers_df = papers_df.merge(_pre_scored_df, on="paper_id", how="left")
+        _papers_list_for_layerer = papers_df.copy()
+        if "cluster_id" in _papers_list_for_layerer.columns:
+            _papers_list_for_layerer["cluster_id"] = _papers_list_for_layerer["cluster_id"].fillna(-1).astype(int)
+        _tagged = Layerer().tag(_papers_list_for_layerer.to_dict("records"))
+        _tag_df = pd.DataFrame(_tagged)[["paper_id", "layer_tag"]]
         papers_df = papers_df.merge(_tag_df, on="paper_id", how="left")
 
         st.session_state["papers_df"] = papers_df
@@ -884,87 +907,17 @@ if st.session_state["papers_df"] is not None:
         )
         st.dataframe(_tag_counts, width='stretch', hide_index=True)
 
-    # -----------------------------------------------------------------------
-    # Knowledge Graph
-    # -----------------------------------------------------------------------
-    st.divider()
-    st.subheader("Knowledge Graph")
-    st.caption("Citation network visualisation. Node size reflects the selected metric; node colour reflects cluster membership. Edges point from citing paper to cited paper.")
-
-    max_nodes = st.slider(
-        "Max nodes", min_value=20, max_value=500, value=100, step=20,
-        key="graph_max_nodes",
-    )
-
-    papers_for_graph = (
-        st.session_state["papers_df"]
-        .sort_values("citation_count", ascending=False)
-        .head(max_nodes)
-    )
-    node_ids = set(papers_for_graph["paper_id"])
-
-    from pyvis.network import Network
-    import streamlit.components.v1 as components
-
-    net = Network(
-        height="650px", width="100%",
-        bgcolor="#e8e8e8", font_color="#222222",
-        directed=True,
-    )
-    net.barnes_hut()
-
-    for _, row in papers_for_graph.iterrows():
-        if "layer_tag" in papers_for_graph.columns:
-            color = _LAYER_COLORS.get(row.get("layer_tag"), "#888888")
-        else:
-            cid = int(row["cluster_id"]) if pd.notna(row.get("cluster_id")) else -1
-            color = _PALETTE[cid % len(_PALETTE)] if cid >= 0 else "#888888"
-        size = _sized(row["paper_id"])
-        label = (row["title"] or "")[:40]
-        net.add_node(
-            row["paper_id"],
-            label=label,
-            title=(
-                f"{row['title']}\n"
-                f"Year: {row.get('year', '?')}\n"
-                f"Citations: {row.get('citation_count', '?')}"
-                + (f"\nLayer: {row['layer_tag']}" if "layer_tag" in papers_for_graph.columns and pd.notna(row.get("layer_tag")) else "")
-            ),
-            color=color,
-            size=size,
-        )
-
-    citations_df = st.session_state["citations_df"]
-    if citations_df is not None and not citations_df.empty:
-        for _, edge in citations_df.iterrows():
-            if edge["source"] in node_ids and edge["target"] in node_ids:
-                net.add_edge(edge["source"], edge["target"])
-
-    html = net.generate_html()
-    components.html(html, height=660, scrolling=False)
-
-    _kg_btn_col1, _kg_btn_col2 = st.columns(2)
-    _graph_tab_button(net, html, _kg_btn_col1, "knowledge_graph.html")
-
-    _kg_pid_cluster = dict(zip(papers_for_graph["paper_id"], papers_for_graph["cluster_id"].fillna(-1).astype(int)))
-    _kg_pid_title = dict(zip(papers_for_graph["paper_id"], papers_for_graph["title"]))
-    _kg_export_rows = [
-        {
-            "cluster_from": _kg_pid_cluster.get(edge["source"], -1),
-            "from_paper_name": _kg_pid_title.get(edge["source"], edge["source"]),
-            "cluster_to": _kg_pid_cluster.get(edge["target"], -1),
-            "to_paper_name": _kg_pid_title.get(edge["target"], edge["target"]),
-        }
-        for _, edge in citations_df.iterrows()
-        if citations_df is not None and edge["source"] in node_ids and edge["target"] in node_ids
-    ] if citations_df is not None and not citations_df.empty else []
-    if _kg_export_rows:
-        _kg_btn_col2.download_button(
-            "⬇ Export view as CSV",
-            data=pd.DataFrame(_kg_export_rows).to_csv(index=False).encode("utf-8"),
-            file_name="knowledge_graph_view.csv",
-            mime="text/csv",
-            key="kg_export_csv",
+    _cl_labels = st.session_state.get("cluster_labels") or {}
+    if _cl_labels:
+        _cl_options = {f"Cluster {cid}: {label}": cid for cid, label in sorted(_cl_labels.items())}
+        _cl_selected_label = st.selectbox("Inspect cluster", list(_cl_options.keys()), key="cluster_inspect_select")
+        _cl_selected_id = _cl_options[_cl_selected_label]
+        _cl_papers = papers_df[papers_df["cluster_id"] == _cl_selected_id].copy()
+        _cl_show_cols = [c for c in ["title", "year", "layer_tag", "citation_count", "local_citation_count", "journal"] if c in _cl_papers.columns]
+        st.dataframe(
+            _cl_papers[_cl_show_cols].sort_values("citation_count", ascending=False).reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
         )
 
     # -----------------------------------------------------------------------
@@ -1000,7 +953,6 @@ if st.session_state["papers_df"] is not None:
 
     import io
     import networkx as nx
-    from src.graph.engine import GraphEngine
 
     exp_col1, exp_col2, exp_col3, exp_col4 = st.columns(4)
 
@@ -1012,18 +964,24 @@ if st.session_state["papers_df"] is not None:
         mime="text/csv",
     )
 
-    citations_csv = st.session_state["citations_df"].to_csv(index=False).encode("utf-8")
-    exp_col2.download_button(
-        "⬇ citations.csv",
-        data=citations_csv,
-        file_name="citations.csv",
-        mime="text/csv",
-    )
+    _citations_df_export = st.session_state["citations_df"]
+    if _citations_df_export is not None:
+        citations_csv = _citations_df_export.to_csv(index=False).encode("utf-8")
+        exp_col2.download_button(
+            "⬇ citations.csv",
+            data=citations_csv,
+            file_name="citations.csv",
+            mime="text/csv",
+        )
 
-    _G = GraphEngine().build_graph(
-        st.session_state["papers_df"],
-        st.session_state["citations_df"],
-    )
+    _G = st.session_state.get("graph")
+    if _G is None:
+        from src.graph.engine import GraphEngine
+        _G = GraphEngine().build_graph(
+            st.session_state["papers_df"],
+            st.session_state["citations_df"],
+        )
+        st.session_state["graph"] = _G
     _graphml_buf = io.BytesIO()
     nx.write_graphml(_G, _graphml_buf)
     exp_col3.download_button(

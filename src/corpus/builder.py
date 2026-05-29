@@ -26,6 +26,9 @@ class CorpusBuilder:
         self._client = client
         self.papers_df: pd.DataFrame = pd.DataFrame()
         self.citations_df: pd.DataFrame = pd.DataFrame()
+        self._doi_attempted: set = set()
+        self._venue_attempted: set = set()
+        self._ref_attempted: set = set()
 
     # ------------------------------------------------------------------
     # Corpus construction
@@ -87,93 +90,6 @@ class CorpusBuilder:
             _cache.save()
 
         self.papers_df = df
-        return self.papers_df
-
-    def seed_scopus(
-        self,
-        scopus_client,
-        query: str,
-        limit: int = 500,
-        year_range: Optional[Tuple[int, int]] = None,
-    ) -> pd.DataFrame:
-        """
-        Build initial corpus from Scopus search results.
-
-        After fetching from Scopus, tries to resolve each paper's DOI to a
-        Semantic Scholar paper ID so that reference fetching works normally.
-        Papers with no S2 match keep their Scopus EID as paper_id (references
-        will be recovered later via OpenAlex enrichment).
-
-        Returns papers_df; also stored as self.papers_df.
-        """
-        raw = scopus_client.search(query, limit=limit)
-        if not raw:
-            self.papers_df = pd.DataFrame()
-            return self.papers_df
-
-        papers = [Paper.from_api_dict(d) for d in raw if d.get("paperId")]
-
-        df = papers_to_df(papers)
-
-        if year_range is not None and not df.empty:
-            year_min, year_max = year_range
-            mask = df["year"].notna() & df["year"].between(year_min, year_max)
-            df = df[mask].reset_index(drop=True)
-
-        self.papers_df = df
-        return self.papers_df
-
-    def seed_both(
-        self,
-        scopus_client,
-        query: str,
-        limit: int = 500,
-        year_range: Optional[Tuple[int, int]] = None,
-    ) -> pd.DataFrame:
-        """
-        Seed corpus from both Semantic Scholar and Scopus, merged by DOI.
-
-        S2 results are fetched first (up to limit). Scopus results are fetched
-        next (up to limit), then merged: papers already in the S2 set (matched
-        by DOI) are skipped; new papers are appended. The merged set is
-        capped at limit.
-
-        Returns papers_df; also stored as self.papers_df.
-        """
-        # Step 1: S2 seed
-        self.seed(query, limit=limit, year_range=year_range)
-        s2_dois = set(
-            str(d).lower()
-            for d in self.papers_df["doi"]
-            if d is not None and not (isinstance(d, float) and pd.isna(d))
-        )
-
-        # Step 2: Scopus seed — resolve S2 IDs, deduplicate
-        raw_scopus = scopus_client.search(query, limit=limit)
-        if raw_scopus:
-            new_papers = []
-            for d in raw_scopus:
-                doi = d.get("doi")
-                if doi and doi.lower() in s2_dois:
-                    continue  # already in S2 results
-                p = Paper.from_api_dict(d)
-                if p.paper_id:
-                    new_papers.append(p)
-
-            if new_papers:
-                new_df = papers_to_df(new_papers)
-                if year_range is not None:
-                    year_min, year_max = year_range
-                    mask = new_df["year"].notna() & new_df["year"].between(year_min, year_max)
-                    new_df = new_df[mask].reset_index(drop=True)
-
-                self.papers_df = (
-                    pd.concat([self.papers_df, new_df], ignore_index=True)
-                    .drop_duplicates(subset=["paper_id"])
-                    .head(limit)
-                    .reset_index(drop=True)
-                )
-
         return self.papers_df
 
     def extract_domains(self) -> list[str]:
@@ -238,7 +154,7 @@ class CorpusBuilder:
         self.papers_df = filtered_df
         return self.papers_df
 
-    def fetch_references(self, paper_ids=None) -> pd.DataFrame:
+    def fetch_references(self, paper_ids=None, on_progress=None) -> pd.DataFrame:
         """
         Fetch references for corpus papers and build citations_df.
 
@@ -247,6 +163,8 @@ class CorpusBuilder:
         Args:
             paper_ids: List of paper IDs to fetch refs for.
                        Defaults to all IDs in self.papers_df.
+            on_progress: Optional callable(current: int, total: int) called every
+                         10 papers and on the final paper.
 
         Returns:
             citations_df with columns [source, target, title, year];
@@ -258,8 +176,9 @@ class CorpusBuilder:
                 return self.citations_df
             paper_ids = list(self.papers_df["paper_id"])
 
+        total = len(paper_ids)
         all_citations = []
-        for paper_id in paper_ids:
+        for i, paper_id in enumerate(paper_ids):
             # Scopus EIDs (2-s2.0-...) are not valid S2 paper IDs — skip them;
             # their intra-corpus edges are recovered by enrich_references() via OpenAlex.
             if str(paper_id).startswith("2-s2.0-"):
@@ -272,6 +191,10 @@ class CorpusBuilder:
                 c = Citation.from_api_dict(r)
                 if c.source and c.target:
                     all_citations.append(c)
+            if on_progress is not None:
+                done = i + 1
+                if done % 10 == 0 or done == total:
+                    on_progress(done, total)
 
         _cache = getattr(self._client, "_cache", None)
         if _cache is not None:
@@ -386,6 +309,10 @@ class CorpusBuilder:
                 continue
             year = row.get("year")
             year = int(year) if pd.notna(year) else None
+            paper_id = row.get("paper_id")
+            if paper_id in self._doi_attempted:
+                continue
+            self._doi_attempted.add(paper_id)
             result = crossref_client.lookup(title, year=year)
             if result is None:
                 failed += 1
@@ -424,7 +351,7 @@ class CorpusBuilder:
         of candidate papers for which OpenAlex returned no usable edges.
         """
         if self.papers_df.empty:
-            return 0
+            return 0, 0
 
         # Build normalized DOI → paper_id index
         doi_index: dict = {}
@@ -468,6 +395,9 @@ class CorpusBuilder:
 
         for _, row in candidates.iterrows():
             paper_id = row["paper_id"]
+            if paper_id in self._ref_attempted:
+                continue
+            self._ref_attempted.add(paper_id)
             doi = row.get("doi")
             if doi is not None and (isinstance(doi, float) and pd.isna(doi)):
                 doi = None
@@ -533,6 +463,10 @@ class CorpusBuilder:
             if not (pd.isna(current) or current is None or str(current).strip() == ""):
                 continue
 
+            paper_id = row.get("paper_id")
+            if paper_id in self._venue_attempted:
+                continue
+            self._venue_attempted.add(paper_id)
             result = None
             doi = row.get("doi")
             if doi and pd.notna(doi) and str(doi).strip():
@@ -571,59 +505,6 @@ class CorpusBuilder:
 
         if filled and getattr(self._client, "_cache", None) is not None:
             self._client._cache.save()
-
-        return filled, failed
-
-    def enrich_from_scopus(self, scopus_client) -> tuple[int, int]:
-        """
-        Fill missing venue, abstract, and citation count from Scopus by DOI.
-
-        Only queries Scopus for rows that have a DOI and are missing at least
-        one of: journal, abstract. Citation count is updated if Scopus reports
-        a higher value (Scopus counts are generally more complete).
-
-        Returns (filled, failed) where filled = rows where at least one field
-        was updated.
-        """
-        if self.papers_df.empty:
-            return 0, 0
-
-        filled = 0
-        failed = 0
-
-        for idx, row in self.papers_df.iterrows():
-            doi = row.get("doi")
-            if not doi or (isinstance(doi, float) and pd.isna(doi)):
-                continue
-
-            needs_venue = pd.isna(row.get("journal")) or not str(row.get("journal") or "").strip()
-            needs_abstract = pd.isna(row.get("abstract")) or not str(row.get("abstract") or "").strip()
-            scopus_citations = int(row.get("citation_count") or 0)
-
-            if not (needs_venue or needs_abstract):
-                continue
-
-            result = scopus_client.get_by_doi(str(doi).strip())
-            if not result:
-                failed += 1
-                continue
-
-            updated = False
-            if needs_venue and result.get("venue"):
-                self.papers_df.at[idx, "journal"] = result["venue"]
-                updated = True
-            if needs_abstract and result.get("abstract"):
-                self.papers_df.at[idx, "abstract"] = result["abstract"]
-                updated = True
-            scopus_count = result.get("citationCount") or 0
-            if scopus_count > scopus_citations:
-                self.papers_df.at[idx, "citation_count"] = scopus_count
-                updated = True
-
-            if updated:
-                filled += 1
-            else:
-                failed += 1
 
         return filled, failed
 

@@ -28,6 +28,7 @@ class RelevanceFilter:
                         academic text similarity.
         """
         self._model = SentenceTransformer(model_name)
+        self._query_cache: dict = {}
 
     def filter(
         self,
@@ -61,14 +62,15 @@ class RelevanceFilter:
             for d in candidates
         ]
 
-        embeddings = self._model.encode(
-            [query] + texts,
-            convert_to_tensor=True,
-            show_progress_bar=False,
-        )
+        if query not in self._query_cache:
+            self._query_cache[query] = self._model.encode(
+                query, convert_to_tensor=True, show_progress_bar=False
+            )
+        query_vec = self._query_cache[query]
 
-        query_vec = embeddings[0]
-        cand_vecs = embeddings[1:]
+        cand_vecs = self._model.encode(
+            texts, convert_to_tensor=True, show_progress_bar=False
+        )
 
         scores = util.cos_sim(query_vec, cand_vecs)[0]  # shape (N,)
 

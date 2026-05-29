@@ -1,6 +1,6 @@
 from collections import Counter
 from itertools import combinations
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Set, Tuple
 
 import pandas as pd
 
@@ -152,3 +152,63 @@ class CoCitationAnalyzer:
             result[pid] = int(label)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Spring-layout graph for visualization
+    # ------------------------------------------------------------------
+
+    def build_spring_graph(
+        self,
+        cocitation_df: pd.DataFrame,
+        title_lookup: dict,
+        decile: float = 0.99,
+    ) -> Tuple:
+        """
+        Build a NetworkX Graph for matplotlib spring-layout visualization.
+
+        Filters edges to the top (1 - decile) fraction by cocitation_count,
+        applies Girvan-Newman community detection (first split), and returns
+        the graph with a community membership dict.
+
+        Args:
+            cocitation_df: Output of build_cocitation_matrix().
+            title_lookup:  Dict mapping paper_id -> title (for node labels).
+            decile:        Quantile threshold for edge filtering (default 0.99).
+
+        Returns:
+            Tuple (G, community_dict, filtered_df) where:
+              G              — nx.Graph with 'weight' edge attribute and 'label' node attribute
+              community_dict — Dict[node_id, int community_id]
+              filtered_df    — DataFrame subset used to build G
+        """
+        import networkx as nx
+
+        _empty_G = nx.Graph()
+        _empty_dict: dict = {}
+
+        if cocitation_df.empty:
+            return _empty_G, _empty_dict, cocitation_df
+
+        threshold = cocitation_df["cocitation_count"].quantile(decile)
+        filtered = cocitation_df[cocitation_df["cocitation_count"] >= threshold]
+
+        if filtered.empty:
+            return _empty_G, _empty_dict, filtered
+
+        G = nx.Graph()
+        for _, row in filtered.iterrows():
+            a, b, w = row["paper_a"], row["paper_b"], row["cocitation_count"]
+            G.add_node(a, label=(title_lookup.get(a) or a)[:40])
+            G.add_node(b, label=(title_lookup.get(b) or b)[:40])
+            G.add_edge(a, b, weight=int(w))
+
+        if G.number_of_edges() == 0:
+            return G, {n: 0 for n in G.nodes()}, filtered
+
+        communities_gen = nx.algorithms.community.girvan_newman(G)
+        top_level = tuple(sorted(c) for c in next(communities_gen))
+        community_dict = {
+            node: i for i, comm in enumerate(top_level) for node in comm
+        }
+
+        return G, community_dict, filtered

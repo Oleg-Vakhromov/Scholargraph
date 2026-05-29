@@ -1,6 +1,6 @@
 from collections import Counter
 from itertools import combinations
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Set, Tuple
 
 import pandas as pd
 
@@ -150,3 +150,60 @@ class BibliographicCoupler:
             result[pid] = int(label)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Spring-layout graph for visualization
+    # ------------------------------------------------------------------
+
+    def build_spring_graph(
+        self,
+        coupling_df: pd.DataFrame,
+        title_lookup: dict,
+        decile: float = 0.99,
+    ) -> Tuple:
+        """
+        Build a NetworkX Graph for matplotlib spring-layout visualization.
+
+        Filters edges to the top (1 - decile) fraction by coupling_strength,
+        applies Girvan-Newman community detection (first split), and returns
+        the graph with a community membership dict.
+
+        Args:
+            coupling_df:  Output of build_coupling_matrix().
+            title_lookup: Dict mapping paper_id -> title.
+            decile:       Quantile threshold for edge filtering (default 0.99).
+
+        Returns:
+            Tuple (G, community_dict, filtered_df).
+        """
+        import networkx as nx
+
+        _empty_G = nx.Graph()
+        _empty_dict: dict = {}
+
+        if coupling_df.empty:
+            return _empty_G, _empty_dict, coupling_df
+
+        threshold = coupling_df["coupling_strength"].quantile(decile)
+        filtered = coupling_df[coupling_df["coupling_strength"] >= threshold]
+
+        if filtered.empty:
+            return _empty_G, _empty_dict, filtered
+
+        G = nx.Graph()
+        for _, row in filtered.iterrows():
+            a, b, w = row["paper_a"], row["paper_b"], row["coupling_strength"]
+            G.add_node(a, label=(title_lookup.get(a) or a)[:40])
+            G.add_node(b, label=(title_lookup.get(b) or b)[:40])
+            G.add_edge(a, b, weight=int(w))
+
+        if G.number_of_edges() == 0:
+            return G, {n: 0 for n in G.nodes()}, filtered
+
+        communities_gen = nx.algorithms.community.girvan_newman(G)
+        top_level = tuple(sorted(c) for c in next(communities_gen))
+        community_dict = {
+            node: i for i, comm in enumerate(top_level) for node in comm
+        }
+
+        return G, community_dict, filtered

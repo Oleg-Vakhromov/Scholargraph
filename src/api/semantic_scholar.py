@@ -48,17 +48,17 @@ class SemanticScholarClient:
         return status_code in (429, 500, 502, 503, 504)
 
     def _get(self, path: str, params: dict) -> dict:
-        delay = 10
+        delay = 60
         response = None
-        for attempt in range(5):
+        for attempt in range(4):
             self._wait_for_rate_limit()
             response = requests.get(f"{BASE_URL}{path}", params=params, headers=self._headers())
             self._last_request_time = time.time()
             if not self._should_retry(response.status_code):
                 break
-            if attempt < 4:
+            if attempt < 3:
                 time.sleep(delay)
-                delay = min(delay * 2, 120)
+                delay = min(delay * 2, 240)
 
         if not response.ok:
             raise RuntimeError(
@@ -67,17 +67,17 @@ class SemanticScholarClient:
         return response.json()
 
     def _post(self, path: str, params: dict, body: dict) -> list:
-        delay = 10
+        delay = 60
         response = None
-        for attempt in range(5):
+        for attempt in range(4):
             self._wait_for_rate_limit()
             response = requests.post(f"{BASE_URL}{path}", params=params, json=body, headers=self._headers())
             self._last_request_time = time.time()
             if not self._should_retry(response.status_code):
                 break
-            if attempt < 4:
+            if attempt < 3:
                 time.sleep(delay)
-                delay = min(delay * 2, 120)
+                delay = min(delay * 2, 240)
 
         if not response.ok:
             raise RuntimeError(
